@@ -12,7 +12,7 @@ fn session(artboards: usize) -> Session {
     s
 }
 
-fn svg(s: &mut Session, p: Value) -> String {
+pub(super) fn svg(s: &mut Session, p: Value) -> String {
     let mut p = p;
     p["format"] = json!("svg");
     s.execute("document.serialize", &p).unwrap_or_else(|e| panic!("{p}: {e}"))["text"].as_str().unwrap().to_string()
@@ -25,7 +25,7 @@ fn tmp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 /// A session whose document holds one embedded 2×2 PNG.
-fn image_session() -> Session {
+pub(super) fn image_session() -> Session {
     let mut png = Vec::new();
     image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 200, 30, 255]))
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
@@ -165,7 +165,7 @@ fn save_writes_svg_and_remembers_its_options() {
     let native = dir.join("doc.vectorcraft").to_string_lossy().to_string();
     s.execute("document.save", &json!({"path": native})).unwrap();
     assert!(vectorcraft_format::sniff(&std::fs::read(&native).unwrap()));
-    assert_eq!(s.doc().unwrap().save_options, Value::Null);
+    assert!(s.doc().unwrap().save_options.is_empty(), "a native save remembers no options");
     let _ = std::fs::remove_dir_all(dir);
 }
 

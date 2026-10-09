@@ -365,8 +365,15 @@ fn tiny_png() -> Vec<u8> {
 #[test]
 fn image_roundtrip() {
     let mut d = doc(200.0, 200.0);
-    d.images.insert("img1".into(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(tiny_png()) });
-    let im = ImageObject { key: "img1".into(), width: 4, height: 2, xf: Affine::translate((20.0, 30.0)) * Affine::scale(10.0), link: None };
+    d.images.insert("img1".into(), ImageBlob::new("image/png", tiny_png()));
+    let im = ImageObject {
+        key: "img1".into(),
+        width: 4,
+        height: 2,
+        xf: Affine::translate((20.0, 30.0)) * Affine::scale(10.0),
+        link: None,
+        placement: Default::default(),
+    };
     add(&mut d, Node::new(NodeId(0), NodeKind::Image(im)));
     let out = roundtrip(&d);
     let l = leaves(&out);
@@ -425,6 +432,20 @@ fn import_handmade_pdf() {
     // Gray 0.5 and the `cm` translation.
     assert_eq!(l[2].appearance.fill_paint().color().unwrap().to_hex(), "#808080");
     assert!(close(l[2].geometric_bounds().unwrap(), Rect::new(150.0, 270.0, 190.0, 300.0), 1e-6));
+}
+
+/// Art off the page opens on the pasteboard round its artboard, not cut away (#472).
+#[test]
+fn import_keeps_art_outside_the_page() {
+    let content = "0 0 1 rg 10 10 50 30 re f 0 1 0 rg -300 -300 50 50 re f 1 0 0 rg 500 500 20 20 re f";
+    let d = import(&handmade_pdf(content, "[0 0 200 300]")).unwrap();
+    assert!(close(d.artboards[0].rect, Rect::new(0.0, 0.0, 200.0, 300.0), 1e-9));
+    let bounds: Vec<Rect> = leaves(&d).iter().map(|n| n.geometric_bounds().unwrap()).collect();
+    let want = [Rect::new(10.0, 260.0, 60.0, 290.0), Rect::new(-300.0, 550.0, -250.0, 600.0), Rect::new(500.0, -220.0, 520.0, -200.0)];
+    assert_eq!(bounds.len(), want.len(), "{bounds:?}");
+    for (b, w) in bounds.iter().zip(want) {
+        assert!(close(*b, w, 1e-6), "{b:?} vs {w:?}");
+    }
 }
 
 #[test]
@@ -515,8 +536,11 @@ fn compatibility_levels() {
     }
     let a = export(&d, &with(|s| s.standard = Standard::PdfA2b)).unwrap();
     assert!(String::from_utf8_lossy(&a).contains("pdfaid"), "PDF/A identification in XMP");
-    for x in [Standard::PdfX1a, Standard::PdfX3, Standard::PdfX4] {
-        assert!(matches!(export(&d, &with(|s| s.standard = x)), Err(PdfError::Unsupported(_))), "{x:?}");
+    // PDF/X files are PDF 1.3 (PDF/X-1a, PDF/X-3) or at most 1.6 (PDF/X-4): not the default 1.7.
+    for (x, header) in [(Standard::PdfX1a, "%PDF-1.3"), (Standard::PdfX3, "%PDF-1.3"), (Standard::PdfX4, "%PDF-1.6")] {
+        assert!(matches!(export(&d, &with(|s| s.standard = x)), Err(PdfError::BadSetting(_))), "{x:?}");
+        let b = export(&d, &with(|s| (s.standard, s.compatibility) = (x, x.version()))).unwrap();
+        assert!(b.starts_with(header.as_bytes()), "{x:?}");
     }
     // PDF/A-2b is a PDF 1.7 standard.
     let e = export(&d, &with(|s| (s.standard, s.compatibility) = (Standard::PdfA2b, Compatibility::Pdf20)));

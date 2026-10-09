@@ -1,6 +1,7 @@
 //! The command registry. Ids follow Illustrator's menu structure.
 
 pub(crate) mod appearance;
+mod assets;
 mod attributes;
 mod brushsym;
 mod buildcmds;
@@ -9,37 +10,58 @@ mod colorcmds;
 pub mod colormgmt;
 pub mod colortheme;
 mod create;
+mod css;
+mod cut;
 pub(crate) mod distortcmds;
 mod docinfo;
 mod docmenu;
+pub(crate) mod docsetup;
 mod draw2;
 mod edit;
 mod effectcmd;
 pub mod expand;
+pub(crate) mod fileinfo;
 pub mod fileio;
 pub mod flatten;
 mod fonts;
 pub(crate) mod freeform;
 pub(crate) mod gradient;
 pub(crate) mod graph;
+mod halftone;
 pub mod help;
+pub(crate) mod inline;
 mod layer;
+mod layerpanel;
+pub mod links;
 mod live;
 pub(crate) mod maskedit;
 pub(crate) mod menucmds;
 pub(crate) mod newart;
+pub mod newdoc;
 mod object;
 mod opacitymask;
 mod overprint;
+mod package;
 mod paint;
 mod panelcmds;
 mod path;
 mod pathops;
 mod patterncmds;
+pub mod pdfcmds;
+pub mod perspgrid;
+pub(crate) mod place;
+pub mod plugin;
 pub mod prefscmds;
+pub mod print;
+pub(crate) mod printadvanced;
+pub mod printpresets;
+pub mod printtiling;
 pub mod rasterfx;
 mod recolor;
+pub mod recovery;
 mod select;
+pub(crate) mod shaper;
+pub(crate) mod slices;
 mod stroke;
 mod style;
 pub mod stylelib;
@@ -54,6 +76,7 @@ pub(crate) mod typecmd;
 mod typemenu;
 pub(crate) mod views;
 pub mod wand;
+pub mod webexport;
 mod xform;
 
 use serde::Serialize;
@@ -123,6 +146,19 @@ pub fn has_selection(s: &Session) -> std::result::Result<(), String> {
     let st = s.active().ok_or("no document open")?;
     if st.selection.is_empty() { Err("nothing selected".into()) } else { Ok(()) }
 }
+/// Objects are selected, or the Artboard tool is chosen (Copy and Cut take its artboard).
+pub fn has_selection_or_artboard_tool(s: &Session) -> std::result::Result<(), String> {
+    if s.tool_id() == "artboard" { has_doc(s) } else { has_selection(s) }
+}
+/// Objects or ruler guides are selected (what Delete and the arrow keys act on).
+pub fn has_selection_or_guides(s: &Session) -> std::result::Result<(), String> {
+    let st = s.active().ok_or("no document open")?;
+    if st.selection.has_objects_or_guides() { Ok(()) } else { Err("nothing selected".into()) }
+}
+pub fn has_anchors(s: &Session) -> std::result::Result<(), String> {
+    let st = s.active().ok_or("no document open")?;
+    if st.selection.anchors.values().all(|a| a.is_empty()) { Err("no anchor points selected".into()) } else { Ok(()) }
+}
 pub fn has_multi(s: &Session) -> std::result::Result<(), String> {
     let st = s.active().ok_or("no document open")?;
     if st.selection.len() < 2 { Err("select at least two objects".into()) } else { Ok(()) }
@@ -171,6 +207,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(gradient::specs());
         v.extend(opacitymask::specs());
         v.extend(layer::specs());
+        v.extend(layerpanel::specs());
         v.extend(draw2::specs());
         v.extend(xform::specs());
         v.extend(effectcmd::specs());
@@ -182,6 +219,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(colormgmt::specs());
         v.extend(typemenu::specs());
         v.extend(textedit::specs());
+        v.extend(inline::specs());
         v.extend(textstyles::specs());
         v.extend(fonts::specs());
         v.extend(help::specs());
@@ -196,6 +234,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(docinfo::specs());
         v.extend(panelcmds::specs());
         v.extend(buildcmds::specs());
+        v.extend(shaper::specs());
         v.extend(brushsym::specs());
         v.extend(patterncmds::specs());
         v.extend(prefscmds::specs());
@@ -211,6 +250,27 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(newart::specs());
         v.extend(colortheme::specs());
         v.extend(fileio::pdf::specs());
+        v.extend(docsetup::specs());
+        v.extend(newdoc::specs());
+        v.extend(place::specs());
+        v.extend(links::specs());
+        v.extend(pdfcmds::specs());
+        v.extend(fileio::dxf::specs());
+        v.extend(fileio::eps::specs());
+        v.extend(package::specs());
+        v.extend(slices::specs());
+        v.extend(print::specs());
+        v.extend(recovery::specs());
+        v.extend(fileio::dxfimport::specs());
+        v.extend(webexport::specs());
+        v.extend(assets::specs());
+        v.extend(css::specs());
+        v.extend(printpresets::specs());
+        v.extend(printtiling::specs());
+        v.extend(plugin::specs());
+        v.extend(cut::specs());
+        v.extend(halftone::specs());
+        v.extend(perspgrid::specs());
         v
     })
 }
@@ -334,39 +394,25 @@ pub(crate) fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
     (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
 }
 
-/// A 1-based page/artboard range such as `"1-3, 5"` → 0-based indices in the order given (repeats
-/// dropped). Each number must lie in `1..=count`; `"3-"` runs to the last one, `"-2"` from the first.
-pub(crate) fn parse_range(s: &str, count: usize) -> std::result::Result<Vec<usize>, String> {
-    let num = |t: &str, open: usize| -> std::result::Result<usize, String> {
-        let t = t.trim();
-        if t.is_empty() {
-            return Ok(open);
-        }
-        t.parse().ok().filter(|n| (1..=count).contains(n)).ok_or_else(|| format!("range `{s}`: `{t}` is not a number from 1 to {count}"))
-    };
-    let mut out = vec![];
-    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let (a, b) = match part.replace('\u{2013}', "-").split_once('-') {
-            Some((a, b)) if a.trim().is_empty() && b.trim().is_empty() => return Err(format!("range `{s}`: `{part}` names no number")),
-            Some((a, b)) => (num(a, 1)?, num(b, count)?),
-            None => {
-                let n = num(part, 0)?;
-                (n, n)
-            }
-        };
-        if a > b {
-            return Err(format!("range `{s}`: `{part}` runs backwards"));
-        }
-        for i in a - 1..b {
-            if !out.contains(&i) {
-                out.push(i);
-            }
-        }
+pub(crate) use vectorcraft_doc::range::parse_range;
+
+/// A date param in Unix seconds that defaults to the clock: `None` when absent (now, see
+/// [`clock_date`]), `Some(None)` for null (no date), else `Some(Some(seconds))`.
+pub(crate) fn date_param(p: &Value, key: &str, cmd: &str) -> Result<Option<Option<i64>>> {
+    match p.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => v.as_i64().map(|t| Some(Some(t))).ok_or_else(|| bad(cmd, format!("{key} must be Unix seconds (an integer) or null"))),
     }
-    if out.is_empty() {
-        return Err(format!("range `{s}` is empty"));
-    }
-    Ok(out)
+}
+
+/// The date a command stamps: `given` (see [`date_param`]), else now (none on the web, which has
+/// no clock). It joins the running command's journal entry as `key`, so a replay of the journal
+/// gives the same date whenever it runs (an action leaves it out: [`crate::Session::journal_for_action`]).
+pub(crate) fn clock_date(s: &mut Session, key: &str, given: Option<Option<i64>>) -> Option<i64> {
+    let t = given.unwrap_or_else(vectorcraft_doc::metadata::now_unix);
+    s.note_journal(key, serde_json::json!(t));
+    t
 }
 
 /// The Transparency panel's state ([`Session::transparency_info`]).
@@ -383,3 +429,12 @@ pub use flatten::FlattenOptions;
 
 /// A built-in or saved flattener preset ([`crate::Prefs::flattener_presets`]).
 pub use flatten::FlattenerPreset;
+
+/// Command ids kept only so older scripts keep working: `(alias, the command it duplicates)`.
+/// They run as before but the command palette leaves them out (it lists the command once).
+pub const ALIASES: &[(&str, &str)] = &[("object.convertDocumentColorMode", "file.documentColorMode")];
+
+/// Is `id` an [`ALIASES`] entry?
+pub fn is_alias(id: &str) -> bool {
+    ALIASES.iter().any(|(a, _)| *a == id)
+}

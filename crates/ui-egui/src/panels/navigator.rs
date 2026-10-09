@@ -2,8 +2,6 @@
 //! document revision) with the red view box you drag to pan, zoom out/in buttons, a zoom slider
 //! and a zoom field.
 
-use std::cell::RefCell;
-
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::json;
 use vectorcraft_geom::{Point, Rect as DRect};
@@ -13,6 +11,7 @@ use crate::VectorcraftApp;
 use crate::theme::Tokens;
 use crate::widgets::{self, menu_item};
 
+#[derive(Default)]
 struct Cache {
     renderer: Option<vectorcraft_render::Renderer>,
     key: Option<(usize, u64, u32, u32, bool)>,
@@ -20,7 +19,7 @@ struct Cache {
 }
 
 thread_local! {
-    static CACHE: RefCell<Cache> = const { RefCell::new(Cache { renderer: None, key: None, tex: None }) };
+    static CACHE: crate::graphics::TexCache<Cache> = crate::graphics::TexCache::default();
 }
 
 /// Map a document point into the thumbnail rect (region → rect, aspect preserved).
@@ -50,7 +49,7 @@ pub fn slider_to_zoom(t: f64) -> f64 {
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let Some(st) = app.session.active() else {
-        super::empty_state(ui, "map", "No document", "Open a document to navigate it.");
+        super::empty_state(ui, "map", tl!("No document"), tl!("Open a document to navigate it."));
         return;
     };
     let artboard_only: bool = pstate(ui.ctx(), "nav-ab-only");
@@ -118,7 +117,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         if let Some(v) = widgets::plain_field(ui, "nav-zoom", zoom, "%", 2, 64.0) {
             z = Some(v);
         }
-        if widgets::icon_button(ui, "dc-zoom-small", "Zoom Out", false, 22.0).clicked() {
+        if widgets::icon_button(ui, "dc-zoom-small", tl!("Zoom Out"), false, 22.0).clicked() {
             app.run("view.zoomOut", json!({})).ok();
         }
         let sw = (ui.available_width() - 30.0).max(40.0);
@@ -128,7 +127,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         {
             z = Some(slider_to_zoom(v as f64));
         }
-        if widgets::icon_button(ui, "dc-zoom-large", "Zoom In", false, 22.0).clicked() {
+        if widgets::icon_button(ui, "dc-zoom-large", tl!("Zoom In"), false, 22.0).clicked() {
             app.run("view.zoomIn", json!({})).ok();
         }
         if let Some(z) = z {
@@ -139,10 +138,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
 
 pub fn menu(_app: &mut VectorcraftApp, ui: &mut Ui) {
     let ab: bool = pstate(ui.ctx(), "nav-ab-only");
-    if menu_item(ui, "View Artboard Only", true, ab) {
+    if menu_item(ui, tl!("View Artboard Only"), true, ab) {
         set_pstate(ui.ctx(), "nav-ab-only", !ab);
     }
-    menu_item(ui, "Panel Options…", false, false);
+    menu_item(ui, tl!("Panel Options…"), false, false);
 }
 
 #[cfg(test)]

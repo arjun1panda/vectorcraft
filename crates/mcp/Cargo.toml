@@ -22,3 +22,5 @@ log = { workspace = true }
 [dev-dependencies]
 vectorcraft-testkit = { workspace = true }
 proptest = { workspace = true }
+image = { workspace = true }
+socket2 = { workspace = true }

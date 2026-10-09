@@ -399,8 +399,10 @@ fn envelope_release_and_expand() {
     s.execute("object.envelope.expand", &json!({})).unwrap();
     let g = node(&s, e);
     assert!(matches!(g.kind, NodeKind::Group { .. }));
-    let p = g.children().unwrap()[0].path_data().unwrap().anchor_count();
-    assert!(p > 4);
+    // (Distort Appearance, on for new envelopes, expands the stroke too: the fill comes first.)
+    let mut fill = None;
+    g.walk(&mut |c| fill = fill.or_else(|| c.path_data().map(|p| p.anchor_count())));
+    assert!(fill.unwrap() > 4);
 }
 
 #[test]
@@ -587,8 +589,7 @@ fn mesh_hit_test_inside() {
     sel(&mut s, &[a]);
     s.execute("object.mesh.create", &json!({"rows": 2, "cols": 2})).unwrap();
     let d = &s.doc().unwrap().doc;
-    let h =
-        vectorcraft_doc::hit::hit_test(d, Point::new(50.0, 30.0), vectorcraft_doc::hit::HitOptions { tol: 1.0, outline: false, path_only: false });
+    let h = vectorcraft_doc::hit::hit_test(d, Point::new(50.0, 30.0), vectorcraft_doc::hit::HitOptions { tol: 1.0, ..Default::default() });
     assert_eq!(h.map(|h| h.leaf), Some(a));
 }
 

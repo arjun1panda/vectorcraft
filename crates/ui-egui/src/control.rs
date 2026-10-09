@@ -5,6 +5,7 @@
 //! - `engine.commands`: engine + UI commands with enablement
 //! - `document.inspect`: document summary; `ui.inspect`: UI state
 //! - `ui.menu.list`: flattened menu tree
+//! - `ui.contextMenu.list`: the canvas context menu for the current selection, flattened
 //! - `ui.tool.select {tool}`, `ui.tool.list`
 //! - `ui.pointer {events:[{kind: down|drag|up|move|doubleclick, x, y, space?: "doc"|"screen"}], mods?}`:
 //!   drive the active tool through the same path as the mouse
@@ -76,12 +77,26 @@ pub fn inspect(app: &VectorcraftApp, ctx: &egui::Context) -> Value {
         "tool": app.session.tool_id(),
         "toolOptions": app.session.tool_options(),
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
+        // Not saved with the UI state, so not in `ui`: 0 normal … 3 Presentation Mode.
+        "screenMode": app.ui.screen_mode,
+        // The Contextual Task Bar: pinned (not saved either) and where it shows.
+        "taskBar": {
+            "pinned": app.ui.task_bar_place.pinned,
+            "rect": crate::canvas::task_bar_rect(ctx).map(|r| json!([r.left(), r.top(), r.width(), r.height()])),
+        },
+        // The Free Transform tool's widget, where it shows.
+        "freeTransformWidget": crate::free_transform::rect(ctx).map(|r| json!([r.left(), r.top(), r.width(), r.height()])),
         "view": app.view().map(|v| serde_json::to_value(v).unwrap_or_default()),
         "canvasRect": app.canvas_rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "window": [r.width(), r.height()],
         "documents": app.session.documents().iter().map(|d| json!({"title": d.title(), "dirty": d.is_dirty()})).collect::<Vec<_>>(),
         "activeDocument": app.session.active_index(),
         "perf": {"frameMs": app.perf.frame_ms, "renderMs": app.perf.render_ms, "fps": app.perf.fps},
+        "graphicsAdapter": app.graphics_adapter,
+        // The menus are in the macOS menu bar rather than the window.
+        "nativeMenuBar": app.services.native_menu.is_some(),
+        // Saves and exports still being written in the background (Background Save / Export).
+        "background": app.background.jobs.iter().map(|j| j.label.as_str()).collect::<Vec<_>>(),
     })
 }
 
@@ -101,6 +116,13 @@ fn key_from(name: &str) -> Option<egui::Key> {
     })
 }
 
+/// The modifier keys a request holds down (`cmd`, `ctrl`, `alt`, `shift`; `cmd` is Command on
+/// macOS, Ctrl elsewhere).
+fn modifiers(p: &Value) -> egui::Modifiers {
+    let b = |n: &str| p.get(n).and_then(Value::as_bool).unwrap_or(false);
+    egui::Modifiers { alt: b("alt"), ctrl: b("ctrl"), shift: b("shift"), mac_cmd: b("cmd") && cfg!(target_os = "macos"), command: b("cmd") }
+}
+
 pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlRequest) -> Outcome {
     let p = &req.params;
     let s = |k: &str| p.get(k).and_then(Value::as_str);
@@ -112,9 +134,10 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
             wrap(app.run(id, params))
         }
         "engine.commands" => ok(all_commands(app)),
-        "document.inspect" => wrap(app.run("document.inspect", json!({}))),
+        "document.inspect" => wrap(app.run("document.inspect", p.clone())),
         "ui.inspect" => ok(inspect(app, ctx)),
         "ui.menu.list" => ok(serde_json::to_value(crate::menus::menu_entries(app)).unwrap_or_default()),
+        "ui.contextMenu.list" => ok(serde_json::to_value(crate::menus::context_entries(app)).unwrap_or_default()),
         "ui.tool.select" => wrap(app.run("tool.select", json!({"tool": s("tool").unwrap_or("")}))),
         "ui.tool.list" => ok(serde_json::to_value(vectorcraft_tools::TOOL_GROUPS).unwrap_or_default()),
         "ui.pointer" => {
@@ -142,26 +165,25 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                     vectorcraft_geom::Point::new(x, y)
                 };
                 let mods = e.get("mods").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or(base_mods);
-                crate::canvas::dispatch(app, &PointerEvent { kind, pos, mods, pressure: 1.0 }, view);
+                crate::canvas::dispatch(app, &PointerEvent { kind, pos, mods, pressure: PointerEvent::json_pressure(e) }, view);
+                let hold = PointerEvent::json_hold(e);
+                if hold > 0.0 {
+                    let r = app.session.tool_tick(hold, view);
+                    crate::canvas::apply_requests(app, r);
+                }
             }
             ctx.request_repaint();
             wrap(app.run("document.inspect", json!({})).map(|d| json!({"selection": d["selection"], "tool": app.session.tool_id()})))
         }
         "ui.key" => {
             let Some(k) = s("key").and_then(key_from) else { return err("unknown or missing `key`") };
-            let b = |n: &str| p.get(n).and_then(Value::as_bool).unwrap_or(false);
-            let m = egui::Modifiers {
-                alt: b("alt"),
-                ctrl: b("ctrl"),
-                shift: b("shift"),
-                mac_cmd: b("cmd") && cfg!(target_os = "macos"),
-                command: b("cmd"),
-            };
+            let m = modifiers(p);
             app.synthetic.push(egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: m });
-            app.synthetic.push(egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m });
+            // Typed text comes with the press, so it shares the key's frame and modifiers.
             if let Some(t) = s("text") {
                 app.synthetic.push(egui::Event::Text(t.to_string()));
             }
+            app.synthetic.push(egui::Event::Key { key: k, physical_key: None, pressed: false, repeat: false, modifiers: m });
             ctx.request_repaint();
             ok(Value::Null)
         }
@@ -178,14 +200,7 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                 Some("right") | Some("secondary") => egui::PointerButton::Secondary,
                 _ => egui::PointerButton::Primary,
             };
-            let b = |n: &str| p.get(n).and_then(Value::as_bool).unwrap_or(false);
-            let modifiers = egui::Modifiers {
-                alt: b("alt"),
-                ctrl: b("ctrl"),
-                shift: b("shift"),
-                mac_cmd: b("cmd") && cfg!(target_os = "macos"),
-                command: b("cmd"),
-            };
+            let modifiers = modifiers(p);
             let a = egui::pos2(f("x"), f("y"));
             let end = if req.method == "ui.drag" { egui::pos2(f("toX"), f("toY")) } else { a };
             app.synthetic.push(egui::Event::PointerMoved(a));
@@ -203,6 +218,18 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
                 app.synthetic.push(egui::Event::PointerButton { pos: end, button, pressed: true, modifiers });
                 app.synthetic.push(egui::Event::PointerButton { pos: end, button, pressed: false, modifiers });
             }
+            ctx.request_repaint();
+            ok(Value::Null)
+        }
+        "ui.wheel" => {
+            // Mouse wheel notches over screen point (x, y): `dy` up (+) or down, `dx` sideways
+            // (`unit: "point"` for trackpad-like points), with modifiers as `ui.click` takes them.
+            let f = |k: &str| p.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+            let unit = if s("unit") == Some("point") { egui::MouseWheelUnit::Point } else { egui::MouseWheelUnit::Line };
+            // Notches, not a flood: a turn stays within what a real wheel sends.
+            let delta = egui::vec2(f("dx"), f("dy")).clamp(egui::Vec2::splat(-100.0), egui::Vec2::splat(100.0));
+            app.synthetic.push(egui::Event::PointerMoved(egui::pos2(f("x"), f("y"))));
+            app.synthetic.push(egui::Event::MouseWheel { unit, delta, phase: egui::TouchPhase::Move, modifiers: modifiers(p) });
             ctx.request_repaint();
             ok(Value::Null)
         }
@@ -304,7 +331,7 @@ pub fn handle(app: &mut VectorcraftApp, ctx: &egui::Context, req: &ControlReques
         "app.open" => wrap(app.run("file.open", json!({"path": s("path")}))),
         "app.save" => wrap(app.run("file.save", if p.is_object() { p.clone() } else { json!({}) })),
         "app.export" => match s("path") {
-            Some(path) => wrap(crate::io::export(app, s("format"), Some(path.to_string()), p).map(|p| json!({"path": p}))),
+            Some(path) => wrap(crate::io::export(app, s("format"), Some(path.to_string()), p)),
             // No save dialog for an agent: the bytes come back, as in headless mode.
             None => wrap(app.run("document.export", p.clone())),
         },

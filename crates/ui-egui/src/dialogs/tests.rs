@@ -4,6 +4,7 @@ use serde_json::json;
 use vectorcraft_engine::Session;
 
 use super::*;
+use crate::theme;
 
 fn app() -> VectorcraftApp {
     let mut app = VectorcraftApp::new(Session::new(), Default::default());
@@ -166,6 +167,30 @@ fn effect_preview_is_kept_as_one_undo_step() {
 }
 
 #[test]
+fn raster_filter_dialogs_preview_and_apply() {
+    for (effect, key, value) in [("blur.radial", "method", "zoom"), ("blur.smart", "quality", "high"), ("sharpen.unsharpMask", "amount", "120")] {
+        let mut app = app();
+        let id = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap()["id"].as_u64().unwrap();
+        app.run("select.all", json!({})).unwrap();
+        app.run("effect.dialog", json!({"effect": effect})).unwrap();
+        let d = app.ui.dialog.as_mut().unwrap();
+        let v: serde_json::Value = value.parse::<f64>().map_or_else(|_| json!(value), |n| json!(n));
+        d.fields.insert(key.into(), v.clone());
+        frame(&mut app, Default::default());
+        assert!(app.session.in_interaction(), "{effect}: previews");
+        confirm(&mut app).unwrap();
+        let n = app.session.doc().unwrap().doc.node(vectorcraft_doc::NodeId(id)).unwrap().clone();
+        assert_eq!(n.appearance.effects.len(), 1, "{effect}");
+        assert_eq!(n.appearance.effects[0].params[key], v, "{effect}");
+    }
+    // Fields follow the effect's documented order (its dialog's), not the alphabet.
+    let doc = vectorcraft_effects::effect_info("blur.smart").unwrap().params;
+    let ranks: Vec<usize> = ["radius", "threshold", "quality"].iter().map(|k| super::effect::doc_rank(doc, k)).collect();
+    assert!(ranks.windows(2).all(|w| w[0] < w[1]), "{ranks:?}");
+    assert_eq!(super::effect::doc_rank(doc, "nope"), usize::MAX);
+}
+
+#[test]
 fn effect_dialog_applies_to_its_appearance_item() {
     let mut app = app();
     let id = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap()["id"].as_u64().unwrap();
@@ -245,4 +270,103 @@ fn dialogs_do_not_stretch_to_the_screen() {
         checked += 1;
     }
     assert!(checked >= 10, "only {checked} dialogs drew in the shared frame");
+}
+
+/// The dialog window of `app`'s open dialog after a few frames in a `w` × 900 window.
+fn dialog_rect(app: &mut VectorcraftApp, w: f32) -> egui::Rect {
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, Default::default());
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 900.0));
+    let kind = app.ui.dialog.as_ref().unwrap().kind.clone();
+    for _ in 0..3 {
+        let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+        ctx.run_ui(input, |ui| show(app, ui.ctx())).textures_delta.clear();
+    }
+    ctx.memory(|m| m.area_rect(egui::Id::new(("dialog", kind.as_str())))).unwrap()
+}
+
+#[test]
+fn a_form_dialog_is_as_wide_as_its_fields_not_the_window() {
+    let mut app = app();
+    // Clean Up: three check boxes in the generic parameter dialog.
+    let params = json!({"emptyTextPaths": true, "strayPoints": true, "unpaintedObjects": true});
+    app.run("ui.paramDialog", json!({"command": "object.path.cleanUp", "label": "Clean Up", "params": params})).unwrap();
+    let wide = dialog_rect(&mut app, 1600.0);
+    assert!(wide.width() < 500.0, "Clean Up is {:.0} wide in a 1600-point window", wide.width());
+    // The same dialog in a narrow window still fits it.
+    let narrow = dialog_rect(&mut app, 360.0);
+    assert!(narrow.width() <= 360.0, "{:.0} wide in a 360-point window", narrow.width());
+}
+
+#[test]
+fn menu_parameter_dialogs_are_compact() {
+    // #292: Object › Path › Simplify (and its neighbours) spanned the whole window.
+    for id in ["object.path.simplify", "object.path.offsetPath", "object.move", "object.rotate", "object.path.splitIntoGrid", "path.average"] {
+        let mut app = app();
+        app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 50})).unwrap();
+        app.run("select.all", json!({})).unwrap();
+        crate::menus::invoke(&mut app, id, json!({}));
+        assert!(app.ui.dialog.is_some(), "{id} opened no dialog");
+        let wide = dialog_rect(&mut app, 1600.0);
+        eprintln!("{id}: {:.0} × {:.0} in a 1600-point window", wide.width(), wide.height());
+        assert!(wide.width() < 420.0, "{id} is {:.0} wide in a 1600-point window", wide.width());
+    }
+}
+
+/// A list mixing built-in labels with names translates only the built-in entries: names that
+/// happen to be catalog keys ("Black", "Regular") are shown as they are.
+#[test]
+fn mixed_lists_translate_only_their_built_in_entries() {
+    use crate::i18n::{Lang, tr};
+    let zh = Lang::from_code("zh-hant").unwrap();
+    for key in ["None", "Black", "Regular", "Default"] {
+        assert_ne!(tr(zh, key), key, "{key} must be a catalog key for this test");
+    }
+    let names = ["None", "Black", "Regular", "Default"];
+    assert_eq!(shown_names(zh, &names, |k| k == 0 || k == 3), [tr(zh, "None"), "Black", "Regular", tr(zh, "Default")]);
+    assert_eq!(shown_names(zh, &names, |_| false), names);
+    assert_eq!(shown_names(Lang::EN, &names, |_| true), names);
+}
+
+/// Confirmations and plug-in dialogs are headed by the text they are given (callers translate
+/// their own templates; a plug-in's name is its own).
+#[test]
+fn given_headings_are_shown_as_they_are() {
+    let d = Dialog::new(confirm::KIND, json!({"message": "Delete “Black”?", "detail": "Regular"}));
+    assert_eq!((spec(&d.kind).heading)(&d), "Delete “Black”?");
+    let d = Dialog::new(plugin::KIND, json!({"__label": "Black", "__plugin": "x"}));
+    assert_eq!((spec(&d.kind).heading)(&d), "Black");
+}
+
+#[test]
+fn a_dialog_opens_with_its_first_field_focused_so_typing_and_enter_apply() {
+    let mut app = app();
+    let id = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 40, "height": 20})).unwrap()["id"].as_u64().unwrap();
+    let ctx = egui::Context::default();
+    theme::install_fonts(&ctx);
+    theme::apply(&ctx, Default::default());
+    let frame = |app: &mut VectorcraftApp, events: Vec<egui::Event>| {
+        let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| show(app, ui.ctx()));
+        out.textures_delta.clear();
+    };
+    let enter = || egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() };
+    let bounds = |app: &VectorcraftApp| app.session.doc().unwrap().doc.node(vectorcraft_doc::NodeId(id)).unwrap().geometric_bounds().unwrap();
+    // Object › Transform › Rotate…: type 90 over the angle, press Enter.
+    crate::menus::invoke(&mut app, "object.rotate", json!({}));
+    frame(&mut app, vec![]);
+    frame(&mut app, vec![egui::Event::Text("90".into())]);
+    frame(&mut app, vec![enter()]);
+    assert!(app.ui.dialog.is_none());
+    let b = bounds(&app);
+    assert!((b.width() - 20.0).abs() < 1e-6 && (b.height() - 40.0).abs() < 1e-6, "{b:?}");
+    // Move…: its first field is a distance (with a unit): typing replaces it as well.
+    let before = bounds(&app);
+    crate::menus::invoke(&mut app, "object.move", json!({}));
+    frame(&mut app, vec![]);
+    frame(&mut app, vec![egui::Event::Text("15".into())]);
+    frame(&mut app, vec![enter()]);
+    assert!(app.ui.dialog.is_none());
+    let after = bounds(&app);
+    assert!((after.x0 - before.x0 - 15.0).abs() < 1e-6 && (after.y0 - before.y0).abs() < 1e-6, "{before:?} → {after:?}");
 }

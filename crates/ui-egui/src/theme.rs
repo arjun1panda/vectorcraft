@@ -83,6 +83,12 @@ pub struct Tokens {
     pub caption_close_text: Color32,
     /// What preview images mark (Flattener Preview highlights).
     pub highlight: Color32,
+    /// The bleed outline around artboards (Document Setup → Bleed).
+    pub bleed: Color32,
+    /// Error marks (a missing linked file).
+    pub error: Color32,
+    /// Warning marks (a modified linked file).
+    pub warning: Color32,
 }
 
 impl Tokens {
@@ -124,6 +130,9 @@ impl Tokens {
             caption_close: hex(0xc42b1c),
             caption_close_text: Color32::WHITE,
             highlight: hex(0xff3030),
+            bleed: hex(0xf03030),
+            error: hex(0xe34850),
+            warning: hex(0xf0a330),
         };
         match b {
             Brightness::Dark => base,
@@ -245,7 +254,26 @@ pub fn install_fonts(ctx: &egui::Context) {
     let mut mono = vec!["JetBrainsMono".to_string()];
     mono.extend(fallback);
     fonts.families.insert(FontFamily::Name(FONT_MONO.into()), mono);
+    add_craft_fonts(&mut fonts);
     ctx.set_fonts(fonts);
+}
+
+/// The egui name of a craft-fonts face.
+pub(crate) fn craft_font_name(f: &vectorcraft_text::CraftFont) -> String {
+    format!("craft-fonts {} {}", f.family, f.style)
+}
+
+/// The Japanese craft-fonts faces (when built with `CRAFT_FONTS_DIR`) as fallbacks at the end of
+/// every family, after the app's own fonts and before the installed fonts `ui_fonts` adds: BIZ
+/// UDPGothic first (bold first in the semibold family), then the Mincho faces.
+fn add_craft_fonts(fonts: &mut FontDefinitions) {
+    for f in vectorcraft_text::CRAFT_FONTS.iter().filter(|f| f.is_japanese()) {
+        fonts.font_data.insert(craft_font_name(f), Arc::new(FontData::from_static(f.bytes)));
+    }
+    for (family, stack) in fonts.families.iter_mut() {
+        let bold = *family == FontFamily::Name(FONT_UI_SEMIBOLD.into());
+        stack.extend(vectorcraft_text::craft_fonts::japanese_ui_fonts(bold).into_iter().map(craft_font_name));
+    }
 }
 
 /// Apply tokens to egui's global style.

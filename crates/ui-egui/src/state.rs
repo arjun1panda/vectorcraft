@@ -17,11 +17,31 @@ pub struct View {
     pub fitted: bool,
     /// View rotation in degrees (Rotate View tool).
     pub rotation: f64,
+    /// The artboard the status bar's navigator is on (an index): Fit Artboard in Window and Actual
+    /// Size show it.
+    #[serde(default)]
+    pub artboard: usize,
 }
 
 impl Default for View {
     fn default() -> Self {
-        Self { zoom: 1.0, center: Point::new(306.0, 396.0), fitted: false, rotation: 0.0 }
+        Self { zoom: 1.0, center: Point::new(306.0, 396.0), fitted: false, rotation: 0.0, artboard: 0 }
+    }
+}
+
+impl View {
+    /// The view a document opens at: the one it was saved with, else fitted on first display.
+    pub fn of(st: &vectorcraft_engine::DocState) -> Self {
+        match &st.view {
+            Some(v) if v.zoom.is_finite() && v.zoom > 0.0 && v.center.x.is_finite() && v.center.y.is_finite() => Self {
+                zoom: v.zoom.clamp(0.0313, 640.0),
+                center: v.center,
+                fitted: true,
+                rotation: if v.rotation.is_finite() { v.rotation } else { 0.0 },
+                artboard: 0,
+            },
+            _ => Self::default(),
+        }
     }
 }
 
@@ -54,6 +74,30 @@ pub enum DockTab {
     Properties,
     Layers,
     Libraries,
+}
+
+impl DockTab {
+    /// The tab's panel id (`window.panel`), English label and icon (when the dock is collapsed).
+    pub fn info(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            DockTab::Properties => ("properties", "Properties", "dc-options"),
+            DockTab::Layers => ("layers", "Layers", "layers"),
+            DockTab::Libraries => ("libraries", "Libraries", "library"),
+        }
+    }
+
+    pub const ALL: [DockTab; 3] = [DockTab::Properties, DockTab::Layers, DockTab::Libraries];
+
+    /// The tab whose panel id is `id`.
+    pub fn from_id(id: &str) -> Option<DockTab> {
+        DockTab::ALL.into_iter().find(|t| t.info().0 == id)
+    }
+}
+
+/// Every panel `window.panel` shows, as (id, English label): the dock tabs, then the icon panels.
+pub fn all_panels() -> impl Iterator<Item = (&'static str, &'static str)> {
+    let tabs = DockTab::ALL.into_iter().map(|t| (t.info().0, t.info().1));
+    tabs.chain(ICON_PANELS.iter().map(|&(id, label, _)| (id, label)))
 }
 
 /// Panels that live as collapsed icons in the dock (Essentials Classic).
@@ -91,6 +135,9 @@ pub const ICON_PANELS: &[(&str, &str, &str)] = &[
     (crate::panels::flattener_preview::ID, "Flattener Preview", "eye"),
     ("attributes", "Attributes", "settings"),
     ("colorThemes", "Color Themes", "sun"),
+    (crate::panels::links::ID, "Links", "link"),
+    (crate::panels::asset_export::ID, "Asset Export", "share-2"),
+    (crate::panels::css_properties::ID, "CSS Properties", "globe"),
 ];
 
 /// Groups of icon panels separated by dividers in the collapsed column.
@@ -189,9 +236,19 @@ impl Dialog {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
+    /// The interface language older versions saved here (`ja`, `cs`…). It now lives in the
+    /// `interfaceLanguage` preference, which [`crate::prefs_dialog::restore`] carries it over to;
+    /// it is never written back.
+    #[serde(rename = "language", skip_serializing)]
+    pub legacy_language: Option<String>,
     pub brightness: Brightness,
     pub dock_tab: DockTab,
-    /// Icon panel currently popped out of the collapsed column.
+    /// The dock's tabbed group (Properties | Layers | Libraries) is collapsed to icons at the top of
+    /// the icon column (the dock's double arrow, `window.collapseDock`).
+    #[serde(default)]
+    pub dock_collapsed: bool,
+    /// Icon panel currently popped out of the collapsed column (also `properties`, `layers` or
+    /// `libraries` while the dock is collapsed).
     pub open_panel: Option<String>,
     pub control_bar: bool,
     pub toolbar: bool,
@@ -201,9 +258,23 @@ pub struct UiState {
     pub toolbar_advanced: bool,
     #[serde(default = "yes")]
     pub task_bar: bool,
+    /// Where the Contextual Task Bar was dragged or pinned. Not saved, as in Illustrator: the bar
+    /// starts under the selection at every launch.
+    #[serde(skip)]
+    pub task_bar_place: TaskBarPlace,
     /// Last tool shown in each toolbar slot (keyed by the slot's first tool id).
     #[serde(default)]
     pub slot_tool: std::collections::BTreeMap<String, String>,
+    /// Tool flyouts torn off the toolbar into floating panels.
+    #[serde(default)]
+    pub floating_flyouts: Vec<FloatingFlyout>,
+    /// Panels dragged out of the dock: each group floats as its own stack of tabs.
+    #[serde(default)]
+    pub floating_panels: Vec<FloatingPanels>,
+    /// The Tools panel floats with its top-left corner here (dragged out by its title bar); `None`:
+    /// docked at the window's left edge.
+    #[serde(default)]
+    pub toolbar_pos: Option<[f32; 2]>,
     pub status_bar: bool,
     pub dock: bool,
     pub view: ViewFlags,
@@ -215,7 +286,10 @@ pub struct UiState {
     pub status: String,
     pub palette_open: bool,
     pub palette_query: String,
-    /// Screen mode: 0 normal, 1 full screen with menu, 2 full screen, 3 presentation.
+    /// Screen mode: 0 normal, 1 full screen with menu, 2 full screen, 3 presentation. Not saved:
+    /// the app always starts in Normal Screen Mode, with its menus and panels (#472: a saved
+    /// Presentation Mode came back on restart with no way out).
+    #[serde(skip)]
     pub screen_mode: u8,
     /// Draw Normal / Behind / Inside.
     pub draw_mode: u8,
@@ -244,6 +318,9 @@ pub struct UiState {
     /// Type → Recent Fonts, most recent first.
     #[serde(default)]
     pub recent_fonts: Vec<String>,
+    /// Families starred in the font menus (the ★ filter shows only these).
+    #[serde(default)]
+    pub favorite_fonts: Vec<String>,
     /// Engine preferences (Edit → Preferences), persisted alongside the UI state.
     #[serde(default)]
     pub engine_prefs: Value,
@@ -263,6 +340,107 @@ pub struct UiState {
     /// The SVG Options chosen last (`svg` object of the export/save commands; null: never used).
     #[serde(default)]
     pub svg_options: Value,
+    /// File → Place: Link is on (the Place dialog remembers it).
+    #[serde(default = "yes")]
+    pub place_link: bool,
+    /// The file the open dialog reads, kept out of its JSON fields (Import PDF); dropped when no
+    /// dialog is open.
+    #[serde(skip)]
+    pub dialog_file: Option<std::sync::Arc<crate::dialogs::import_pdf::DialogFile>>,
+    /// The DXF Options chosen last (`document.exportDxf` options; null: never used).
+    #[serde(default)]
+    pub dxf_options: Value,
+    /// The EPS Options chosen last (`document.exportEps` options; null: never used).
+    #[serde(default)]
+    pub eps_options: Value,
+    /// The DXF Import Options chosen last (fit, scaleLineweights, center, mergeLayers; null:
+    /// never used).
+    #[serde(default)]
+    pub dxf_import: Value,
+    /// The Home screen is shown over the open documents (`app.home`): the active document's uid
+    /// and the document count when it opened. Choosing a tab, or a document opening, closing or
+    /// becoming active, leaves it.
+    #[serde(skip)]
+    pub home: Option<(Option<u64>, usize)>,
+    /// Layers panel › Panel Options… (row size, thumbnails, Show Layers Only).
+    #[serde(default)]
+    pub layers_panel: crate::panels::layers::PanelOptions,
+    /// The Image Trace panel's Advanced section is open (as it was last left).
+    #[serde(default = "yes")]
+    pub image_trace_advanced: bool,
+    /// The desktop window's size, position and maximized state, saved when the app quits and
+    /// restored at the next launch (the desktop host reads and writes it; none on the web).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowGeometry>,
+}
+
+/// The desktop window's geometry, kept across launches.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowGeometry {
+    /// Top-left corner of the window frame, in physical pixels on the desktop (none where the
+    /// system doesn't tell windows where they are).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<[i32; 2]>,
+    /// Size of the window's contents in logical pixels (points at 100% UI scaling).
+    pub size: [f32; 2],
+    /// The window was maximized; `pos` and `size` are where un-maximizing puts it.
+    #[serde(default)]
+    pub maximized: bool,
+}
+
+/// A tool group's flyout torn off the toolbar: it floats as its own panel until its × puts it back.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FloatingFlyout {
+    /// The group's tools in flyout order; the first one names the toolbar slot.
+    pub tools: Vec<String>,
+    /// Top-left corner in screen points.
+    pub pos: [f32; 2],
+}
+
+/// Where the Contextual Task Bar sits once its handle has moved it (`window.taskBar.pin`,
+/// `window.taskBar.reset`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TaskBarPlace {
+    /// More Options › Pin Bar Position: the bar stays where it is instead of following the selection.
+    pub pinned: bool,
+    /// Where a pinned bar's top-left corner sits from the canvas's top-left (none when it was
+    /// pinned before it ever showed, until it is drawn). Unpinning leaves it for the next frame
+    /// to turn into `offset`.
+    pub pin_at: Option<egui::Vec2>,
+    /// Where the bar was last drawn, from the canvas's top-left: where pinning holds it.
+    pub shown_at: Option<egui::Vec2>,
+    /// How far an unpinned bar was dragged from its place under the selection, which it keeps while
+    /// it follows the selection, and the document (`DocState::uid`) it was moved in: in another
+    /// document the bar starts under the selection again.
+    pub offset: Option<(u64, egui::Vec2)>,
+}
+
+/// A group of panels dragged out of the dock: it floats as a stack of tabs, one panel shown.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FloatingPanels {
+    /// Panel ids (`window.panel`), in tab order.
+    pub panels: Vec<String>,
+    /// The tab shown.
+    #[serde(default)]
+    pub active: usize,
+    /// Top-left corner in screen points.
+    pub pos: [f32; 2],
+}
+
+impl FloatingPanels {
+    /// Keep known panels, each in one group, drop the groups left empty and the toolbar position
+    /// that isn't a number (a hand-edited preferences file or workspace).
+    pub fn sanitize(groups: &mut Vec<FloatingPanels>, toolbar_pos: &mut Option<[f32; 2]>) {
+        let mut seen = std::collections::BTreeSet::new();
+        groups.retain_mut(|g| {
+            g.panels.retain(|id| all_panels().any(|(p, _)| p == id) && seen.insert(id.clone()));
+            g.active = g.active.min(g.panels.len().saturating_sub(1));
+            !g.panels.is_empty()
+        });
+        if toolbar_pos.is_some_and(|p| !p.iter().all(|v| v.is_finite())) {
+            *toolbar_pos = None;
+        }
+    }
 }
 
 impl UiState {
@@ -277,6 +455,16 @@ impl UiState {
         if self.group_tool.len() != vectorcraft_tools::TOOL_GROUPS.len() {
             self.group_tool = UiState::default().group_tool;
         }
+        // One strip per group, of known tools (a hand-edited preferences file).
+        let mut seen = std::collections::BTreeSet::new();
+        self.floating_flyouts.retain_mut(|f| {
+            f.tools.retain(|id| vectorcraft_tools::tool_info(id).is_some());
+            f.tools.first().is_some_and(|k| seen.insert(k.clone()))
+        });
+        FloatingPanels::sanitize(&mut self.floating_panels, &mut self.toolbar_pos);
+        // Overrides that can't fire (modifier-only chords recorded by older versions, #487) give
+        // the default back.
+        self.shortcut_overrides.retain(|_, c| c.is_empty() || crate::shortcut_editor::normalize(c).is_some());
         self
     }
 }
@@ -284,15 +472,21 @@ impl UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            legacy_language: None,
             brightness: Brightness::MediumDark,
             dock_tab: DockTab::Properties,
+            dock_collapsed: false,
             open_panel: None,
             control_bar: false,
             toolbar: true,
             toolbar_double: false,
             toolbar_advanced: false,
             task_bar: true,
+            task_bar_place: TaskBarPlace::default(),
             slot_tool: Default::default(),
+            floating_flyouts: vec![],
+            floating_panels: vec![],
+            toolbar_pos: None,
             status_bar: true,
             dock: true,
             view: ViewFlags::default(),
@@ -313,12 +507,22 @@ impl Default for UiState {
             custom_workspaces: vec![],
             recent_files: vec![],
             recent_fonts: vec![],
+            favorite_fonts: vec![],
             engine_prefs: Value::Null,
             color_guide: Default::default(),
             library_panel: None,
             flattener_preview: Default::default(),
             color_guide_limit: String::new(),
             svg_options: Value::Null,
+            place_link: true,
+            dialog_file: None,
+            dxf_options: Value::Null,
+            eps_options: Value::Null,
+            dxf_import: Value::Null,
+            home: None,
+            layers_panel: Default::default(),
+            image_trace_advanced: true,
+            window: None,
         }
     }
 }

@@ -57,7 +57,7 @@ fn image_color_at(cx: &ToolContext, n: &Node, p: Point) -> Option<Color> {
         return None;
     }
     let px = im.xf.inverse() * p;
-    let [r, g, b, _] = cx.doc.images.get(&im.key)?.sample(px.x, px.y, cx.raster_sample)?;
+    let [r, g, b, _] = cx.doc.images.get(&im.key)?.sample_object(px.x, px.y, (im.width, im.height), cx.raster_sample)?;
     Some(Color::rgb8(r, g, b))
 }
 
@@ -70,7 +70,9 @@ impl Tool for EyedropperTool {
         if ev.kind != PointerKind::Down {
             return vec![];
         }
-        let opts = vectorcraft_doc::hit::HitOptions { path_only: false, ..cx.hit_options() };
+        // A click inside a fill or among characters samples it too, whatever Object and Type
+        // Object Selection by Path Only say.
+        let opts = vectorcraft_doc::hit::HitOptions { path_only: false, type_path_only: false, ..cx.hit_options() };
         let Some(h) = hit_test(cx.doc, ev.pos, opts) else { return vec![] };
         let src = paint_owner(cx.doc, h.leaf);
         let Some(n) = cx.doc.node(src) else { return vec![] };
@@ -199,7 +201,14 @@ mod tests {
         let mut png = vec![];
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         d.images.insert("px".into(), ImageBlob::png(png));
-        let im = ImageObject { key: "px".into(), width: 3, height: 1, xf: vectorcraft_geom::Affine::scale(10.0), link: None };
+        let im = ImageObject {
+            key: "px".into(),
+            width: 3,
+            height: 1,
+            xf: vectorcraft_geom::Affine::scale(10.0),
+            link: None,
+            placement: Default::default(),
+        };
         d.insert(Some(l), 0, Node::new(id, NodeKind::Image(im))).unwrap();
         let (s, p) = (Selection::default(), paint());
         let mut cx = cx(&d, &s, &p);

@@ -1,9 +1,11 @@
 # Release pipeline: every push to `release` builds signed installers for every platform and
 # creates or updates the draft GitHub Release "VectorCraft v<version>". See docs/releasing.md.
 #
-# All jobs run in the `release` environment (restricted to the `release` branch), which holds
-# the signing secrets. Every secret is optional: missing ones produce unsigned artifacts and a
-# warning, never a failed build.
+# Jobs that sign (macOS, Windows) and the job that creates the release run in the `release`
+# environment (restricted to the `release` branch), which holds the signing secrets. Every secret
+# is optional: missing ones produce unsigned artifacts and a warning, never a failed build. The
+# other jobs sign nothing and get no environment, so a `workflow_dispatch` on any branch is a dry
+# run: they build and upload artifacts, the signed jobs are refused, and no release is drafted.
 name: Release
 
 on:
@@ -35,7 +37,7 @@ jobs:
   version:
     name: version
     runs-on: ubuntu-latest
-    environment: release
+    # No `environment: release`: no secrets here.
     outputs:
       version: ${{ steps.v.outputs.version }}
       date: ${{ steps.v.outputs.date }}
@@ -63,13 +65,20 @@ jobs:
   macos:
     name: macOS universal
     needs: version
-    runs-on: macos-15
+    runs-on: macos-15-xlarge  # M2 Pro larger runner; use only in release.yml (actions_macos_xl budget caps spend)
     environment: release
     env:
       VECTORCRAFT_VERSION: ${{ needs.version.outputs.version }}
       VECTORCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
       - uses: actions/checkout@v4
+      # Japanese UI/document fonts, embedded by crates/text/build.rs (CRAFT_FONTS_DIR on the build
+      # step). Bump the commit deliberately; see craftrules standards/fonts.md.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
@@ -90,6 +99,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: packaging/macos/package.sh --arch universal
       - uses: actions/upload-artifact@v4
         with:
@@ -112,11 +123,21 @@ jobs:
         include:
           - { arch: x64, target: x86_64-pc-windows-msvc }
           - { arch: x86, target: i686-pc-windows-msvc }
+          # Windows on ARM: cross-compiled on the x64 runner, so signing and WiX run as above.
+          # .github/workflows/windows-arm64.yml installs and runs it on ARM64 hardware.
+          - { arch: arm64, target: aarch64-pc-windows-msvc }
     env:
       VECTORCRAFT_VERSION: ${{ needs.version.outputs.version }}
       VECTORCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
       - uses: actions/checkout@v4
+      # Japanese UI/document fonts, embedded by crates/text/build.rs (CRAFT_FONTS_DIR on the build
+      # step). Bump the commit deliberately; see craftrules standards/fonts.md.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -141,6 +162,8 @@ jobs:
           AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           AZURE_CERT_PROFILE: ${{ secrets.AZURE_CERT_PROFILE }}
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: ./packaging/windows/package.ps1 -Arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
@@ -154,7 +177,7 @@ jobs:
     # The oldest GitHub-hosted image, so the binaries only need glibc >= 2.35 (Ubuntu 22.04+,
     # Debian 12+, Fedora 36+, RHEL 10). See docs/releasing.md.
     runs-on: ${{ matrix.runner }}
-    environment: release
+    # No `environment: release`: Linux packages are not signed (checksums in SHA256SUMS.txt).
     strategy:
       fail-fast: false
       matrix:
@@ -167,12 +190,19 @@ jobs:
       NFPM_VERSION: 2.47.0
     steps:
       - uses: actions/checkout@v4
+      # Japanese UI/document fonts, embedded by crates/text/build.rs (CRAFT_FONTS_DIR on the build
+      # step). Bump the commit deliberately; see craftrules standards/fonts.md.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
       - name: Install build and packaging tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev \
-            desktop-file-utils appstream python3-yaml
+            desktop-file-utils appstream python3-yaml zsync
           curl -fsSL -o "$RUNNER_TEMP/nfpm.deb" \
             "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_${{ matrix.deb }}.deb"
           sudo dpkg -i "$RUNNER_TEMP/nfpm.deb"
@@ -184,6 +214,9 @@ jobs:
         if: inputs.version != ''
         run: cargo xtask version set "$VECTORCRAFT_VERSION"
       - name: Build and package (AppImage, deb, rpm, tar.gz)
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: packaging/linux/package.sh
       - name: Check the packages
         run: |
@@ -194,6 +227,12 @@ jobs:
           for appimage in dist/release/*.AppImage; do
             chmod +x "$appimage"
             APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
+            # Update information is embedded, and the .zsync for delta updates sits beside it.
+            # No APPIMAGE_EXTRACT_AND_RUN here: with it the runtime passes --appimage-* flags on
+            # to the app instead of answering them itself.
+            "$appimage" --appimage-updateinformation \
+              | grep -F "gh-releases-zsync|${GITHUB_REPOSITORY%%/*}|${GITHUB_REPOSITORY#*/}|latest|vectorcraft-*-linux-${{ matrix.arch }}.AppImage.zsync"
+            test -s "$appimage.zsync"
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -201,17 +240,116 @@ jobs:
           path: dist/release/*
           if-no-files-found: error
 
+  flatpak:
+    name: Flatpak ${{ matrix.arch }}
+    needs: [version, linux]
+    # Repackages the Linux job's tarball (the same binaries as the AppImage/deb/rpm); no Rust
+    # build here. 24.04 for a newer flatpak-builder (1.4) than 22.04 ships.
+    runs-on: ${{ matrix.runner }}
+    # No `environment: release`: this job signs nothing, so it gets no release secrets.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      VECTORCRAFT_VERSION: ${{ needs.version.outputs.version }}
+      VECTORCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/linux
+      - name: Install flatpak-builder
+        run: |
+          sudo apt-get update
+          # librsvg2-common: the SVG pixbuf loader. flatpak-builder runs the host's
+          # `appstreamcli compose`, which renders the scalable icon and fails without it.
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder librsvg2-common
+          # Ubuntu 24.04's AppArmor blocks the unprivileged user namespaces bubblewrap needs.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Build the Flatpak bundle
+        run: packaging/linux/flatpak-bundle.sh "dist/linux/vectorcraft-$VECTORCRAFT_VERSION-linux-${{ matrix.arch }}.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-flatpak-${{ matrix.arch }}
+          path: dist/release/*.flatpak
+          if-no-files-found: error
+
+  freebsd:
+    name: FreeBSD x86_64
+    needs: version
+    # GitHub has no FreeBSD runners: build in a FreeBSD 14.3 VM (same image and packages as
+    # freebsd.yml).
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    # No `environment: release`: this job signs nothing, so it gets no release secrets.
+    env:
+      VECTORCRAFT_VERSION: ${{ needs.version.outputs.version }}
+      VECTORCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+      # Japanese UI/document fonts, embedded by crates/text/build.rs (CRAFT_FONTS_DIR in the VM).
+      # Bump the commit deliberately; see craftrules standards/fonts.md.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
+      - uses: dtolnay/rust-toolchain@stable
+        if: inputs.version != ''
+      - name: Apply version override
+        if: inputs.version != ''
+        run: cargo xtask version set "$VECTORCRAFT_VERSION"
+      - name: Build and package in a FreeBSD VM
+        # v1.5.9, pinned by commit.
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc
+        with:
+          release: "14.3"
+          usesh: true
+          cpu: 4
+          mem: 12288
+          # Passed through by name; never templated into the script.
+          envs: "VECTORCRAFT_VERSION VECTORCRAFT_BUILD_DATE VECTORCRAFT_BUILD_SHA"
+          prepare: |
+            pkg install -y bash curl git pkgconf cmake python3 libxkbcommon wayland libX11 libXcursor libXrandr libXi libxcb mesa-libs vulkan-loader gtk3 fontconfig freetype2 alsa-lib
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          run: |
+            . "$HOME/.cargo/env"
+            git config --global --add safe.directory "$PWD"
+            # Build outside the checkout so only dist/ is copied back out of the VM.
+            # The craft-fonts checkout is synced into the VM with the workspace.
+            export CRAFT_FONTS_DIR="$PWD/craft-fonts" CRAFT_FONTS_REQUIRED=1
+            export CARGO_TARGET_DIR=/var/tmp/vectorcraft-target CARGO_BUILD_JOBS=4
+            bash packaging/freebsd/package.sh
+            tar -tzf dist/release/vectorcraft-*-freebsd-x86_64.tar.gz \
+              | grep -E '/bin/vectorcraft$|/bin/vectorcraft-cli$|/share/applications/ai\.storyteller\.vectorcraft\.desktop$'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-freebsd
+          path: dist/release/*
+          if-no-files-found: error
+
   web:
     name: Web (wasm)
     needs: version
     runs-on: ubuntu-latest
-    environment: release
+    # No `environment: release`: no secrets here.
     env:
       VECTORCRAFT_VERSION: ${{ needs.version.outputs.version }}
       VECTORCRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
       TRUNK_VERSION: 0.21.14
     steps:
       - uses: actions/checkout@v4
+      # Japanese UI/document fonts, embedded by crates/text/build.rs (CRAFT_FONTS_DIR on the build
+      # step). Bump the commit deliberately; see craftrules standards/fonts.md.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: storytold/craft-fonts
+          ref: abb83316d96aa59c1cf64784289e378fe9fa5695
+          path: craft-fonts
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -227,6 +365,9 @@ jobs:
         if: inputs.version != ''
         run: cargo xtask version set "$VECTORCRAFT_VERSION"
       - name: Build and zip
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
         run: packaging/web/package.sh
       - uses: actions/upload-artifact@v4
         with:
@@ -236,7 +377,9 @@ jobs:
 
   release:
     name: Draft GitHub Release
-    needs: [version, macos, windows, linux, web]
+    # Needs the signed jobs, so a branch dry run (where the environment refuses them) never
+    # drafts a release.
+    needs: [version, macos, windows, linux, flatpak, freebsd, web]
     runs-on: ubuntu-latest
     environment: release
     permissions:

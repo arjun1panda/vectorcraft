@@ -4,7 +4,7 @@
 use egui::{Color32, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
-use vectorcraft_doc::{Appearance, ArrowAlign, Arrowhead, Dash, Document, LineCap, LineJoin, Node, StrokeAlign, StrokeLayer, WidthProfile};
+use vectorcraft_doc::{Appearance, ArrowAlign, Arrowhead, Dash, Document, LineCap, LineJoin, Node, StrokeAlign, StrokeLayer, Unit, WidthProfile};
 use vectorcraft_engine::inspect::StrokeMixed;
 
 use super::{character, current_stroke, pstate, set_pstate, stroke_mixed};
@@ -12,8 +12,34 @@ use crate::theme::Tokens;
 use crate::widgets::{self, menu_item};
 use crate::{VectorcraftApp, icons};
 
-pub const WEIGHT_PRESETS: [f64; 22] =
+/// Stroke weight dropdown presets in points, from the ladder of `unit` (Units > Stroke): each
+/// unit has its own ladder of round values in that unit, so the dropdown reads `0.25 mm`, not the
+/// `0.088 mm` a converted pt ladder gives. Feet, yards and meters, which no stroke is measured
+/// in, keep the pt ladder.
+pub fn weight_presets(unit: Unit) -> [f64; 22] {
+    let native = match unit {
+        Unit::Millimeters => MM_PRESETS,
+        Unit::Centimeters => CM_PRESETS,
+        Unit::Inches => IN_PRESETS,
+        Unit::Pixels => PX_PRESETS,
+        Unit::Picas => return PC_PRESETS,
+        Unit::Points | Unit::FeetInches | Unit::Feet | Unit::Meters | Unit::Yards => return PT_PRESETS,
+    };
+    native.map(|v| unit.to_pt(v))
+}
+
+const PT_PRESETS: [f64; 22] =
     [0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0];
+const MM_PRESETS: [f64; 22] = [0.1, 0.25, 0.35, 0.5, 0.75, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 15.0, 20.0, 25.0, 30.0];
+const CM_PRESETS: [f64; 22] = [0.01, 0.02, 0.03, 0.05, 0.06, 0.07, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0];
+const IN_PRESETS: [f64; 22] =
+    [0.0078, 0.0156, 0.0313, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0];
+const PX_PRESETS: [f64; 22] =
+    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 30.0, 40.0];
+/// The pica ladder (0p1 … 5p) in points, so every entry is an exact pt weight. The dropdown shows
+/// them as decimal picas (`0.083 p`) until [`Unit::number`] writes `0p1` notation.
+const PC_PRESETS: [f64; 22] =
+    [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 15.0, 18.0, 21.0, 24.0, 27.0, 30.0, 33.0, 36.0, 48.0, 60.0];
 
 /// A profile's points as its silhouette: none (the plain bar) for the uniform stroke.
 fn silhouette(points: &[(f64, f64, f64)]) -> Option<&[(f64, f64, f64)]> {
@@ -87,15 +113,18 @@ pub(crate) fn shown_weight(app: &VectorcraftApp, st: Option<&StrokeLayer>, mixed
 
 /// The weight spinner (Stroke panel, Control bar): Units > Stroke, presets, blank when mixed.
 pub(crate) fn weight_field(app: &mut VectorcraftApp, ui: &mut Ui, id: &str, weight: Option<f64>, width: f32) {
-    if let Some(w) = widgets::spin_field(ui, id, weight, app.session.stroke_unit(), width, 1.0, 0.0, &WEIGHT_PRESETS) {
+    let unit = app.session.stroke_unit();
+    if let Some(w) = widgets::spin_field(ui, id, weight, unit, width, 1.0, 0.0, &weight_presets(unit)) {
         set(app, json!({"weight": w}));
     }
 }
 
-/// The Stroke panel in a popover anchored to `resp` (the Control bar's and the Properties
-/// panel's Stroke links), which a click on it toggles.
-pub(crate) fn popover(app: &mut VectorcraftApp, resp: &egui::Response) {
-    egui::Popup::menu(resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+/// The underlined Stroke link (`label`: the Control bar's "Stroke:", the Properties panel's
+/// "Stroke"): a click toggles the Stroke panel in a popover under it.
+pub(crate) fn link(app: &mut VectorcraftApp, ui: &mut Ui, label: &str) {
+    let t = Tokens::get(ui.ctx());
+    let resp = ui.link(egui::RichText::new(label).size(12.0).color(t.text).underline()).on_hover_text(tl!("Stroke options"));
+    widgets::popover(&resp, resp.clicked(), |ui| {
         ui.set_width(260.0);
         show(app, ui);
     });
@@ -110,10 +139,11 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let hidden: bool = pstate(ui.ctx(), "stroke-hide-options");
     let label_w = 64.0;
     let row_label = |ui: &mut Ui, s: &str| {
-        ui.add_sized(vec2(label_w, 24.0), egui::Label::new(egui::RichText::new(s).size(12.5).color(t.text)).halign(egui::Align::RIGHT));
+        let l = ui.add_sized(vec2(label_w, 24.0), egui::Label::new(egui::RichText::new(s).size(12.5).color(t.text)).halign(egui::Align::RIGHT));
+        crate::scrub::note_label(ui, l.rect);
     };
     ui.horizontal(|ui| {
-        row_label(ui, "Weight:");
+        row_label(ui, tl!("Weight:"));
         weight_field(app, ui, "stroke-weight", weight, 120.0);
     });
     if hidden {
@@ -124,11 +154,11 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let join = st.as_ref().map(|s| s.join).filter(|_| !mixed.join);
     let align = st.as_ref().map(|s| s.align).filter(|_| !mixed.align);
     ui.horizontal(|ui| {
-        row_label(ui, "Cap:");
+        row_label(ui, tl!("Cap:"));
         for (v, icon, tip, name) in [
-            (LineCap::Butt, "dc-cap-butt", "Butt Cap", "butt"),
-            (LineCap::Round, "dc-cap-round", "Round Cap", "round"),
-            (LineCap::Square, "dc-cap-square", "Projecting Cap", "square"),
+            (LineCap::Butt, "dc-cap-butt", tl!("Butt Cap"), "butt"),
+            (LineCap::Round, "dc-cap-round", tl!("Round Cap"), "round"),
+            (LineCap::Square, "dc-cap-square", tl!("Projecting Cap"), "square"),
         ] {
             if widgets::icon_button(ui, icon, tip, cap == Some(v), 24.0).clicked() {
                 set(app, json!({"cap": name}));
@@ -136,17 +166,17 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
     });
     ui.horizontal(|ui| {
-        row_label(ui, "Corner:");
+        row_label(ui, tl!("Corner:"));
         for (v, icon, tip, name) in [
-            (LineJoin::Miter, "dc-join-miter", "Miter Join", "miter"),
-            (LineJoin::Round, "dc-join-round", "Round Join", "round"),
-            (LineJoin::Bevel, "dc-join-bevel", "Bevel Join", "bevel"),
+            (LineJoin::Miter, "dc-join-miter", tl!("Miter Join"), "miter"),
+            (LineJoin::Round, "dc-join-round", tl!("Round Join"), "round"),
+            (LineJoin::Bevel, "dc-join-bevel", tl!("Bevel Join"), "bevel"),
         ] {
             if widgets::icon_button(ui, icon, tip, join == Some(v), 24.0).clicked() {
                 set(app, json!({"join": name}));
             }
         }
-        widgets::dim_label(ui, "Limit:");
+        widgets::dim_label(ui, tl!("Limit:"));
         let lim = st.as_ref().map(|s| s.miter_limit).unwrap_or(10.0);
         if !matches!(join, Some(LineJoin::Round | LineJoin::Bevel)) {
             if let Some(v) = widgets::mixed_field(ui, "stroke-limit", (!mixed.miter_limit).then_some(lim), " x", 0, 50.0) {
@@ -157,11 +187,11 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
     });
     ui.horizontal(|ui| {
-        row_label(ui, "Align Stroke:");
+        row_label(ui, tl!("Align Stroke:"));
         for (v, icon, tip, name) in [
-            (StrokeAlign::Center, "dc-stroke-center", "Align Stroke to Center", "center"),
-            (StrokeAlign::Inside, "dc-stroke-inside", "Align Stroke to Inside", "inside"),
-            (StrokeAlign::Outside, "dc-stroke-outside", "Align Stroke to Outside", "outside"),
+            (StrokeAlign::Center, "dc-stroke-center", tl!("Align Stroke to Center"), "center"),
+            (StrokeAlign::Inside, "dc-stroke-inside", tl!("Align Stroke to Inside"), "inside"),
+            (StrokeAlign::Outside, "dc-stroke-outside", tl!("Align Stroke to Outside"), "outside"),
         ] {
             // Only closed paths take a stroke inside or outside (not open paths, not type).
             let enabled = v == StrokeAlign::Center || mixed.can_align;
@@ -176,7 +206,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let (fields, align_corners) = dash_state(dash, pstate(ui.ctx(), "stroke-dash-last"));
     let shown = if mixed.dash { [None; 6] } else { fields };
     ui.horizontal(|ui| {
-        if widgets::check(ui, "Dashed Line", dash.is_some(), st.is_some()) {
+        if widgets::check(ui, tl!("Dashed Line"), dash.is_some(), st.is_some()) {
             if dash.is_some() {
                 set_pstate(ui.ctx(), "stroke-dash-last", Some((fields, align_corners)));
                 set(app, json!({"dash": null}));
@@ -186,10 +216,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
         ui.add_space((ui.available_width() - 56.0).max(0.0));
         let on = dash.is_some();
-        if widgets::icon_button_enabled(ui, "dc-dash-exact", "Exact dash lengths", on && !align_corners, on, 24.0).clicked() {
+        if widgets::icon_button_enabled(ui, "dc-dash-exact", tl!("Exact dash lengths"), on && !align_corners, on, 24.0).clicked() {
             set(app, json!({"alignDashes": false}));
         }
-        if widgets::icon_button_enabled(ui, "dc-dash-align", "Fit dashes to corners and ends", on && align_corners, on, 24.0).clicked() {
+        if widgets::icon_button_enabled(ui, "dc-dash-align", tl!("Fit dashes to corners and ends"), on && align_corners, on, 24.0).clicked() {
             set(app, json!({"alignDashes": true}));
         }
     });
@@ -213,7 +243,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 3.0;
         let fw = ((ui.available_width() - 15.0) / 6.0).clamp(28.0, 40.0);
-        for lbl in ["dash", "gap", "dash", "gap", "dash", "gap"] {
+        for lbl in [tl!("dash"), tl!("gap"), tl!("dash"), tl!("gap"), tl!("dash"), tl!("gap")] {
             ui.add_sized(vec2(fw, 12.0), egui::Label::new(egui::RichText::new(lbl).size(10.5).color(t.text_dim)));
         }
     });
@@ -221,14 +251,14 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     // Arrowheads.
     let (sa, ea) = (st.as_ref().and_then(|s| s.start_arrow), st.as_ref().and_then(|s| s.end_arrow));
     ui.horizontal(|ui| {
-        row_label(ui, "Arrowheads:");
+        row_label(ui, tl!("Arrowheads:"));
         if let Some(a) = arrow_dropdown(ui, "arrow-start", sa, true) {
             set(app, json!({"startArrow": a.map(|a| format!("{a:?}"))}));
         }
         if let Some(a) = arrow_dropdown(ui, "arrow-end", ea, false) {
             set(app, json!({"endArrow": a.map(|a| format!("{a:?}"))}));
         }
-        if widgets::icon_button_enabled(ui, "arrow-left-right", "Swap start and end arrowheads", false, st.is_some(), 22.0).clicked() {
+        if widgets::icon_button_enabled(ui, "arrow-left-right", tl!("Swap start and end arrowheads"), false, st.is_some(), 22.0).clicked() {
             app.run("stroke.setAdvanced", json!({"swapArrows": true})).ok();
         }
     });
@@ -237,7 +267,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     // Scale and Align only mean something for a stroke with a head.
     let (arrow_align, has_head) = arrow_align_state(st.as_ref());
     ui.horizontal(|ui| {
-        row_label(ui, "Scale:");
+        row_label(ui, tl!("Scale:"));
         let mut ns = None;
         ui.add_enabled_ui(has_head, |ui| {
             if let Some(v) = widgets::plain_field(ui, "arrow-scale-s", scale.0, "%", 0, 56.0) {
@@ -247,7 +277,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                 ns = Some((if linked { v } else { scale.0 }, v));
             }
         });
-        if widgets::icon_button(ui, if linked { "link" } else { "link-2-off" }, "Link start and end arrowhead scales", linked, 22.0).clicked() {
+        if widgets::icon_button(ui, if linked { "link" } else { "link-2-off" }, tl!("Link start and end arrowhead scales"), linked, 22.0).clicked() {
             set_pstate(ui.ctx(), "arrow-scale-link", !linked);
         }
         if let Some((a, b)) = ns {
@@ -255,7 +285,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         }
     });
     ui.horizontal(|ui| {
-        row_label(ui, "Align:");
+        row_label(ui, tl!("Align:"));
         for (v, name, icon, tip) in ARROW_ALIGN {
             if widgets::icon_button_enabled(ui, icon, tip, arrow_align == v, has_head, 22.0).clicked() {
                 set(app, json!({"arrowAlign": name}));
@@ -265,15 +295,15 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     widgets::divider(ui);
     // Profile.
     ui.horizontal(|ui| {
-        row_label(ui, "Profile:");
+        row_label(ui, tl!("Profile:"));
         if let Some(id) = profile_dropdown(app, ui, st.as_ref().and_then(|s| s.profile.as_ref())) {
             set(app, json!({"profile": id}));
         }
         let can_flip = st.as_ref().is_some_and(|s| s.profile.is_some());
-        if widgets::icon_button_enabled(ui, "flip-horizontal-2", "Flip Along", false, can_flip, 22.0).clicked() {
+        if widgets::icon_button_enabled(ui, "flip-horizontal-2", tl!("Flip Along"), false, can_flip, 22.0).clicked() {
             app.run("stroke.setAdvanced", json!({"flipProfile": "along"})).ok();
         }
-        if widgets::icon_button_enabled(ui, "flip-vertical-2", "Flip Across", false, can_flip, 22.0).clicked() {
+        if widgets::icon_button_enabled(ui, "flip-vertical-2", tl!("Flip Across"), false, can_flip, 22.0).clicked() {
             app.run("stroke.setAdvanced", json!({"flipProfile": "across"})).ok();
         }
     });
@@ -318,7 +348,7 @@ fn arrow_dropdown(ui: &mut Ui, id: &str, cur: Option<Arrowhead>, start: bool) ->
     let body = Rect::from_min_max(r.min + vec2(3.0, 0.0), pos2(r.right() - 16.0, r.bottom()));
     paint_arrow(ui, body, cur, start, t.text_strong);
     icons::paint(ui, "chevron-down", Rect::from_center_size(pos2(r.right() - 8.0, r.center().y), vec2(10.0, 10.0)), t.icon);
-    let resp = resp.on_hover_text(if start { "Start arrowhead" } else { "End arrowhead" });
+    let resp = resp.on_hover_text(if start { tl!("Start arrowhead") } else { tl!("End arrowhead") });
     let mut out = None;
     egui::Popup::menu(&resp).id(egui::Id::new(("arrow-pop", id))).show(|ui| {
         ui.set_min_width(170.0);
@@ -334,7 +364,7 @@ fn arrow_dropdown(ui: &mut Ui, id: &str, cur: Option<Arrowhead>, start: bool) ->
                 ui.painter().text(
                     row.left_center() + vec2(66.0, 0.0),
                     egui::Align2::LEFT_CENTER,
-                    arrow_label(a),
+                    tl!(arrow_label(a)),
                     egui::FontId::proportional(11.5),
                     t.text,
                 );
@@ -385,7 +415,7 @@ pub(crate) fn profile_dropdown(app: &VectorcraftApp, ui: &mut Ui, cur: Option<&W
     let body = Rect::from_min_max(r.min + vec2(6.0, 5.0), pos2(r.right() - 20.0, r.bottom() - 5.0));
     paint_profile(ui, body, cur.and_then(|p| silhouette(&p.points)), t.text_strong);
     icons::paint(ui, "chevron-down", Rect::from_center_size(pos2(r.right() - 9.0, r.center().y), vec2(10.0, 10.0)), t.icon);
-    let resp = resp.on_hover_text("Variable Width Profile");
+    let resp = resp.on_hover_text(tl!("Variable Width Profile"));
     let mut out = None;
     egui::Popup::menu(&resp).show(|ui| {
         egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
@@ -402,7 +432,14 @@ pub(crate) fn profile_dropdown(app: &VectorcraftApp, ui: &mut Ui, cur: Option<&W
                     ui.painter().rect_filled(row, 0.0, t.hover);
                 }
                 paint_profile(ui, Rect::from_min_size(row.min + vec2(6.0, 6.0), vec2(70.0, 14.0)), silhouette(e.points), t.text_strong);
-                ui.painter().text(row.left_center() + vec2(84.0, 0.0), egui::Align2::LEFT_CENTER, e.label, egui::FontId::proportional(11.5), t.text);
+                ui.painter().text(
+                    row.left_center() + vec2(84.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    // A saved profile's name is the user's.
+                    super::label_or_name(e.label, e.built_in),
+                    egui::FontId::proportional(11.5),
+                    t.text,
+                );
                 if rr.clicked() {
                     out = Some(e.id.to_string());
                     ui.close();
@@ -415,11 +452,11 @@ pub(crate) fn profile_dropdown(app: &VectorcraftApp, ui: &mut Ui, cur: Option<&W
 
 pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let hidden: bool = pstate(ui.ctx(), "stroke-hide-options");
-    if menu_item(ui, if hidden { "Show Options" } else { "Hide Options" }, true, false) {
+    if menu_item(ui, if hidden { tl!("Show Options") } else { tl!("Hide Options") }, true, false) {
         set_pstate(ui.ctx(), "stroke-hide-options", !hidden);
     }
     ui.separator();
-    if menu_item(ui, "Add to Profiles…", crate::menus::enabled(app, "stroke.widthProfile.add"), false) {
+    if menu_item(ui, tl!("Add to Profiles…"), crate::menus::enabled(app, "stroke.widthProfile.add"), false) {
         let name = app.session.next_profile_name();
         let p = json!({"command": "stroke.widthProfile.add", "label": "Variable Width Profile", "params": {"name": name}});
         app.run("ui.paramDialog", p).ok();
@@ -427,10 +464,10 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     // Deletes the selected stroke's saved profile.
     let shown = current_stroke(app).and_then(|s| s.profile);
     let saved = shown.as_ref().and_then(|p| app.session.profile_entry(Some(p))).is_some_and(|e| !e.built_in);
-    if menu_item(ui, "Delete Profile", saved, false) {
+    if menu_item(ui, tl!("Delete Profile"), saved, false) {
         app.run("stroke.widthProfile.delete", json!({})).ok();
     }
-    if menu_item(ui, "Reset Profiles", crate::menus::enabled(app, "stroke.widthProfile.reset"), false) {
+    if menu_item(ui, tl!("Reset Profiles"), crate::menus::enabled(app, "stroke.widthProfile.reset"), false) {
         app.run("stroke.widthProfile.reset", json!({})).ok();
     }
 }

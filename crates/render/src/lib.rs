@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod brush_fx;
+pub mod encode;
 mod freeform;
 mod fx;
 mod group;
@@ -14,12 +15,13 @@ mod ink;
 mod live;
 mod paint;
 mod pattern;
+pub mod placed_document;
 pub mod proof;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject};
+use vectorcraft_doc::{AppearanceItem, Document, Node, NodeId, NodeKind, StrokeAlign, StrokeLayer, TextObject, TraceView};
 use vectorcraft_geom::{Affine, BezPath, FillRule, Rect, Shape};
 use vello_cpu::kurbo;
 use vello_cpu::peniko::{self, BlendMode, Compose, Mix};
@@ -35,6 +37,12 @@ pub use pattern::render_pattern_swatch;
 pub use vectorcraft_effects as effects;
 pub use vello_cpu;
 
+/// Bounds of everything `n` paints, as the renderer culls it: its members, strokes, brush art and
+/// geometry effects, and the shadows and glows of it and its members.
+pub fn painted_bounds(n: &Node) -> Option<Rect> {
+    brush_fx::cull_bounds(n)
+}
+
 /// Largest raster an export may ask [`Renderer::render_region`] for, per side. The CPU rasteriser
 /// addresses at most `u16::MAX` pixels per side (and panics at that edge).
 pub const MAX_RASTER_SIDE: u32 = 32_768;
@@ -48,16 +56,14 @@ pub fn raster_size(region: Rect, scale: f64) -> Result<(u32, u32), String> {
     if !(scale.is_finite() && scale > 0.0) {
         return Err(format!("invalid scale {scale}"));
     }
-    let w = (region.width() * scale).round().max(1.0);
-    let h = (region.height() * scale).round().max(1.0);
-    let max = f64::from(MAX_RASTER_SIDE);
-    if !(w <= max && h <= max && w * h <= MAX_RASTER_PIXELS as f64) {
+    let (w, h) = region_pixels(region, scale);
+    if !(w <= MAX_RASTER_SIDE && h <= MAX_RASTER_SIDE && u64::from(w) * u64::from(h) <= MAX_RASTER_PIXELS) {
         return Err(format!(
-            "the image would be {w:.0} × {h:.0} pixels; raster exports are limited to {MAX_RASTER_SIDE} pixels per side and {} megapixels: lower the scale or resolution",
+            "the image would be {w} × {h} pixels; raster exports are limited to {MAX_RASTER_SIDE} pixels per side and {} megapixels: lower the scale or resolution",
             MAX_RASTER_PIXELS / 1_000_000
         ));
     }
-    Ok((w as u32, h as u32))
+    Ok((w, h))
 }
 
 /// Rendering options.
@@ -87,6 +93,65 @@ pub struct RenderOptions {
     /// View Opacity Mask (Alt-click the mask thumbnail): instead of the artwork, show this object's
     /// opacity mask alone as its coverage in greyscale (white = opaque, black = transparent).
     pub mask_view: Option<NodeId>,
+    /// Screen view: highlight substituted fonts and glyphs as Document Setup asks.
+    pub highlight_substitutions: bool,
+    /// Edge smoothing (raster export option).
+    pub anti_alias: AntiAlias,
+    /// Screen view: placed documents draw from cached bitmaps made in the background (see
+    /// [`placed_document`]); off, they draw exactly, read when needed.
+    pub progressive_placed: bool,
+    /// Screen view: Image Trace objects draw as their View asks (outlines, the source image…);
+    /// off, they draw their tracing result, as exports and printing do.
+    pub trace_views: bool,
+    /// Images are sampled smoothly when scaled or rotated; off, each pixel takes its nearest image
+    /// pixel (Pixel Preview with File Handling › Display Bitmaps as Anti-aliased Images off).
+    pub smooth_images: bool,
+}
+
+/// How edges are rasterized (raster export option).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AntiAlias {
+    /// Hard edges: a pixel is painted when a path, text or image covers at least half of it.
+    /// Raster effects (blur, shadows, glows) and pattern tiles stay smooth.
+    None,
+    /// Smooth edges everywhere.
+    #[default]
+    Art,
+    /// Smooth edges with type snapped to the pixel grid (see `TextLayout::snap_to_pixels`):
+    /// crisper small text.
+    Type,
+}
+
+impl AntiAlias {
+    pub const ALL: [Self; 3] = [Self::None, Self::Art, Self::Type];
+
+    /// The id used in command params (`none`, `art`, `type`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Art => "art",
+            Self::Type => "type",
+        }
+    }
+
+    /// The mode an id names (any case).
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|a| a.id().eq_ignore_ascii_case(id))
+    }
+
+    /// The name shown in options dialogs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Art => "Art Optimized",
+            Self::Type => "Type Optimized",
+        }
+    }
+
+    /// vello's aliasing threshold: paint a pixel only above half coverage when edges are hard.
+    fn threshold(self) -> Option<u8> {
+        (self == Self::None).then_some(127)
+    }
 }
 
 impl Default for RenderOptions {
@@ -103,6 +168,11 @@ impl Default for RenderOptions {
             skip_templates: false,
             tile_edge: vectorcraft_doc::LAYER_COLORS[0].1,
             mask_view: None,
+            highlight_substitutions: false,
+            anti_alias: AntiAlias::Art,
+            progressive_placed: false,
+            trace_views: false,
+            smooth_images: true,
         }
     }
 }
@@ -128,7 +198,8 @@ impl Rendered {
         }
         out
     }
-    /// Encode as PNG.
+    /// Encode as PNG without metadata (thumbnails, screenshots, embedded rasters; exports use
+    /// [`encode`]).
     pub fn to_png(&self) -> Result<Vec<u8>, String> {
         let mut buf = Vec::new();
         let img = image::RgbaImage::from_raw(self.width, self.height, self.to_straight())
@@ -138,30 +209,11 @@ impl Rendered {
     }
     /// Encode as JPEG (flattened on white) at `quality` 1..=100.
     pub fn to_jpeg(&self, quality: u8) -> Result<Vec<u8>, String> {
-        let rgba = self.to_straight();
-        let rgb: Vec<u8> = rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .flat_map(|p| {
-                let a = p[3] as u32;
-                let mix = |c: u8| ((c as u32 * a + 255 * (255 - a)) / 255) as u8;
-                [mix(p[0]), mix(p[1]), mix(p[2])]
-            })
-            .collect();
-        let mut buf = Vec::new();
-        let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality.clamp(1, 100));
-        image::ImageEncoder::write_image(enc, &rgb, self.width, self.height, image::ExtendedColorType::Rgb8)
-            .map_err(|e| format!("JPEG encoding failed: {e}"))?;
-        Ok(buf)
+        encode::jpeg(self, quality, None)
     }
     /// Encode as lossless WebP.
     pub fn to_webp(&self) -> Result<Vec<u8>, String> {
-        let mut buf = Vec::new();
-        let enc = image::codecs::webp::WebPEncoder::new_lossless(&mut buf);
-        image::ImageEncoder::write_image(enc, &self.to_straight(), self.width, self.height, image::ExtendedColorType::Rgba8)
-            .map_err(|e| format!("WebP encoding failed: {e}"))?;
-        Ok(buf)
+        encode::webp(self)
     }
     /// Straight-alpha RGBA at (x, y).
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
@@ -235,6 +287,9 @@ type ClipPaintEntry = (Arc<Node>, Option<Arc<Node>>, Option<Arc<Node>>);
 /// Reusable renderer (keeps the render context, decoded images and glyph caches between frames).
 pub struct Renderer {
     texts: PtrMap<usize, (Arc<Node>, Arc<TextGeom>)>,
+    /// The [`vectorcraft_text::FontDb::generation`] `texts` was laid out with: type lays out
+    /// again when fonts are added or rescanned.
+    text_fonts: u64,
     /// Clip regions per clipping path (see [`Self::clip_of`]).
     clips: PtrMap<usize, ClipEntry>,
     /// Context reused when rendering single-threaded (`threads == 0`).
@@ -261,6 +316,9 @@ pub struct Renderer {
     live: live::LiveCache,
     /// Blurred, tinted drop shadow / outer glow rasters per object and effect (see `fx`).
     shadows: PtrMap<(usize, usize, Ink), fx::ShadowEntry>,
+    /// Objects' content run through Photoshop-style effects, per object and content slot (see
+    /// `fx`): kept only while drawn.
+    pixel_fx: PtrMap<(usize, usize, Ink), fx::PixelEntry>,
     /// Whether the group being drawn is a knockout group (what its neutral children inherit).
     knockout: bool,
     /// Address of the knockout-group element being drawn as its knockout shape: at full object
@@ -283,9 +341,26 @@ pub struct Renderer {
     clip_paints: PtrMap<usize, ClipPaintEntry>,
     /// Placed images as painted in ink planes (see [`ink`]).
     ink_images: ink::InkImages,
+    /// CMYK images as shown through the working CMYK profile (see [`ink`]).
+    cmyk_images: ink::CmykImages,
     /// Gradients along or across strokes, keyed like `strokes` (see [`Self::fill_path_gradient`]).
     stroke_slices: PtrMap<(usize, i32), SliceEntry>,
+    /// The keys and sizes of the recoloured images colour adjustments made in `images`, oldest
+    /// first (see [`Self::adjusted_image`]).
+    adjusted: std::collections::VecDeque<(String, usize)>,
+    /// Layer Options → Dim Images to, of the layer being drawn (screen views only): images show
+    /// faded to this opacity over white.
+    dim_images: Option<f32>,
+    /// Inline graphics being drawn inside inline graphics (a symbol whose art holds text showing
+    /// it): drawing stops at [`MAX_INLINE_DEPTH`].
+    inline_depth: u32,
 }
+
+/// How deep inline graphics nest (text in a symbol shown inline in text…) before they draw nothing.
+const MAX_INLINE_DEPTH: u32 = 4;
+
+/// Set once a missing inline symbol has been logged (it would log every frame otherwise).
+static MISSING_INLINE_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameStats {
@@ -315,10 +390,26 @@ struct Frame<'a> {
     ink: Ink,
 }
 
+impl Frame<'_> {
+    /// Text space → device pixels when type is snapped to the pixel grid (Type anti-aliasing).
+    fn text_snap(&self, t: &TextObject) -> Option<Affine> {
+        (self.opts.anti_alias == AntiAlias::Type).then(|| self.view * t.xf)
+    }
+
+    /// A render context for drawing this frame's art offscreen (on the calling thread), with its
+    /// edge smoothing: hard edges must not depend on where the art is drawn.
+    fn offscreen_context(&self, w: u16, h: u16) -> RenderContext {
+        let mut ctx = single_threaded_context(w, h);
+        ctx.set_aliasing_threshold(self.opts.anti_alias.threshold());
+        ctx
+    }
+}
+
 impl Renderer {
     pub fn new() -> Self {
         Self {
             texts: PtrMap::default(),
+            text_fonts: 0,
             clips: PtrMap::default(),
             ctx_st: None,
             threads: default_threads(),
@@ -333,6 +424,7 @@ impl Renderer {
             stats: FrameStats::default(),
             brushes: Default::default(),
             shadows: PtrMap::default(),
+            pixel_fx: PtrMap::default(),
             live: live::LiveCache::default(),
             knockout: false,
             shape_of: 0,
@@ -343,12 +435,22 @@ impl Renderer {
             clip_paths: vec![],
             clip_paints: PtrMap::default(),
             ink_images: Default::default(),
+            cmyk_images: Default::default(),
             stroke_slices: PtrMap::default(),
+            adjusted: Default::default(),
+            dim_images: None,
+            inline_depth: 0,
         }
     }
 
     /// Render `doc` into a `width`×`height` image using `view` (document → pixel transform).
     pub fn render(&mut self, doc: &Document, width: u32, height: u32, view: Affine, opts: &RenderOptions) -> Rendered {
+        self.render_as(doc, width, height, view, opts, false)
+    }
+
+    /// [`Self::render`], or with `inks` the ink amounts in the working CMYK space instead of
+    /// screen colours (4 bytes a pixel, see [`Self::render_region_inks`]).
+    fn render_as(&mut self, doc: &Document, width: u32, height: u32, view: Affine, opts: &RenderOptions, inks: bool) -> Rendered {
         let start = now();
         let prepared = proof::prepare(doc, opts);
         let doc: &Document = &prepared;
@@ -369,13 +471,13 @@ impl Renderer {
             self.stats.micros = now().saturating_sub(start);
             return Rendered { width: w as u32, height: h as u32, pixels };
         }
-        let mut pixels = if ink::blends_in_cmyk(doc, opts) {
+        let mut pixels = if inks || ink::blends_in_cmyk(doc, opts) {
             // Blending in CMYK: one frame per ink plane, then their inks shown on screen.
             let cmy = self.draw_frame(&Frame { ink: Ink::Cmy, ..frame }, w, h);
             let stats = self.stats;
             let k = self.draw_frame(&Frame { ink: Ink::K, ..frame }, w, h);
             self.stats = stats;
-            ink::compose(&cmy, &k, opts.background)
+            if inks { ink::amounts(&cmy, &k) } else { ink::compose(&cmy, &k, opts.background) }
         } else {
             self.draw_frame(&frame, w, h)
         };
@@ -393,7 +495,11 @@ impl Renderer {
         if self.shadows.len() > 256 {
             self.shadows.retain(|_, e| g - e.stamp <= 3);
         }
-        proof::post(&mut pixels, opts);
+        // Filtered rasters are large: only those of the last frame stay.
+        self.pixel_fx.retain(|_, e| e.stamp == g);
+        if !inks {
+            proof::post(&mut pixels, opts);
+        }
         self.stats.micros = now().saturating_sub(start);
         Rendered { width: w as u32, height: h as u32, pixels }
     }
@@ -409,6 +515,8 @@ impl Renderer {
             }
             _ => RenderContext::new_with(w, h, vello_cpu::RenderSettings { num_threads: threads, ..Default::default() }),
         };
+        // `reset` keeps the threshold of the previous render: set it every time.
+        ctx.set_aliasing_threshold(opts.anti_alias.threshold());
         if let Some(bg) = opts.background {
             ctx.set_transform(Affine::IDENTITY);
             ctx.set_paint(f.ink.fixed(bg));
@@ -475,16 +583,47 @@ impl Renderer {
     /// Render one artboard (or any document rect) at `scale` pixels per point, transparent or on white,
     /// as exported: template layers are left out.
     pub fn render_region(&mut self, doc: &Document, region: Rect, scale: f64, white: bool) -> Rendered {
-        let w = (region.width() * scale).round().max(1.0) as u32;
-        let h = (region.height() * scale).round().max(1.0) as u32;
-        let view = Affine::scale(scale) * Affine::translate((-region.x0, -region.y0));
         let opts = RenderOptions { background: white.then_some([255, 255, 255, 255]), skip_templates: true, ..Default::default() };
-        self.render(doc, w, h, view, &opts)
+        self.render_region_with(doc, region, scale, &opts)
+    }
+
+    /// Render a document rect at `scale` pixels per point with `opts`.
+    pub fn render_region_with(&mut self, doc: &Document, region: Rect, scale: f64, opts: &RenderOptions) -> Rendered {
+        let (w, h) = region_pixels(region, scale);
+        let view = Affine::scale(scale) * Affine::translate((-region.x0, -region.y0));
+        self.render(doc, w, h, view, opts)
+    }
+
+    /// `region` of `doc` as ink amounts in the working CMYK space, 4 bytes a pixel (0 = no ink):
+    /// drawn as the two ink planes of [`ink`], so CMYK colours keep their own inks (black type
+    /// stays black ink alone) and RGB ones are separated with the colour settings. Where nothing
+    /// is drawn (no background) there is no ink. CMYK exports draw this.
+    pub fn render_region_inks(&mut self, doc: &Document, region: Rect, scale: f64, opts: &RenderOptions) -> Vec<u8> {
+        let (w, h) = region_pixels(region, scale);
+        let view = Affine::scale(scale) * Affine::translate((-region.x0, -region.y0));
+        self.render_as(doc, w, h, view, opts, true).pixels
     }
 
     /// Render a single node (thumbnails, previews) fitted into `size`×`size` pixels.
     pub fn render_thumbnail(&mut self, doc: &Document, id: NodeId, size: u32) -> Option<Rendered> {
         self.render_node_thumbnail(doc, doc.node(id)?, size, None)
+    }
+
+    /// Render node `n` of `doc` (its resources) into `w`×`h` transparent pixels through `view`.
+    pub fn render_node(&mut self, doc: &Document, n: &Arc<Node>, w: u16, h: u16, view: Affine) -> Option<Rendered> {
+        let inv = view.inverse();
+        let visible = inv.transform_rect_bbox(Rect::new(0.0, 0.0, w as f64, h as f64));
+        let px = 1.0 / view.determinant().abs().sqrt().max(1e-12);
+        let mut ctx = single_threaded_context(w, h);
+        let opts = RenderOptions::default();
+        let frame = Frame { mt: false, doc, view, visible, px, opts: &opts, ink: Ink::Display };
+        (self.knockout, self.nested, self.backdrop) = (false, 0, None);
+        self.clip_paths.clear();
+        self.draw_arc(&mut ctx, &frame, n);
+        ctx.flush();
+        let mut pm = Pixmap::new(w, h);
+        ctx.render(&mut pm, &mut self.resources);
+        Some(Rendered { width: w as u32, height: h as u32, pixels: pm.data_as_u8_slice().to_vec() })
     }
 
     /// Render any node (also one outside the tree, e.g. opacity-mask art) fitted into
@@ -521,8 +660,10 @@ impl Renderer {
         let b = match &a.kind {
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } if !fx::has_object_fx(a) => {
                 let mut acc: Option<Rect> = None;
+                // An Image Trace object's hidden source image shows in some of its views.
+                let source = a.trace.is_some().then(|| children.first()).flatten();
                 for c in children {
-                    if c.visible {
+                    if c.visible || source.is_some_and(|s| Arc::ptr_eq(s, c)) {
                         acc = vectorcraft_geom::union_opt(acc, self.bounds_of(c));
                     }
                 }
@@ -630,7 +771,7 @@ impl Renderer {
     /// The coverage of opacity mask `m` per output pixel (row-major): its art rendered offscreen,
     /// as luminance ([`mask_value`]).
     fn mask_values(&mut self, f: &Frame, m: &vectorcraft_doc::OpacityMask, w: u16, h: u16) -> Vec<u8> {
-        let mut mctx = single_threaded_context(w, h);
+        let mut mctx = f.offscreen_context(w, h);
         // Mask art is a picture of its own: it takes no part in a knockout group around the object,
         // and its luminance is that of its screen colours.
         let outer =
@@ -679,7 +820,11 @@ impl Renderer {
             && a.blend == vectorcraft_color::BlendMode::Normal
             && !fx::has_fx(a)
         {
-            let g = self.text_geom_of(a, t);
+            let t = &*f.doc.inline_resolved(t);
+            let g = match f.text_snap(t) {
+                Some(xf) => Arc::new(text_geom_snapped(t, Some(xf))),
+                None => self.text_geom_of(a, t),
+            };
             self.draw_text_geom(ctx, f, a, t, &g);
             self.stats.drawn += 1;
             return;
@@ -705,6 +850,31 @@ impl Renderer {
         } else if !n.is_container() {
             return;
         }
+        // Layer Options on screen: a layer whose Preview is off draws in outline, and Dim Images
+        // fades its images (exports and thumbnails, which leave templates out, ignore both).
+        // (A template is dimmed as a whole already.)
+        if let NodeKind::Layer { preview, dim_images, template, .. } = &n.kind
+            && f.opts.dim_templates
+            && !f.opts.skip_templates
+        {
+            if !preview && !f.opts.outline {
+                let opts = RenderOptions { outline: true, ..f.opts.clone() };
+                return self.draw_node(ctx, &Frame { opts: &opts, ..*f }, n, force);
+            }
+            if let Some(p) = dim_images.filter(|_| !template) {
+                let outer = self.dim_images;
+                let dim = f32::from(p).clamp(0.0, 100.0) / 100.0;
+                self.dim_images = Some(outer.map_or(dim, |o| o.min(dim)));
+                self.draw_layer_node(ctx, f, n);
+                self.dim_images = outer;
+                return;
+            }
+        }
+        self.draw_layer_node(ctx, f, n);
+    }
+
+    /// [`Self::draw_node`] after culling and Layer Options.
+    fn draw_layer_node(&mut self, ctx: &mut RenderContext, f: &Frame, n: &Node) {
         if fx::has_object_fx(n) {
             return self.draw_object_fx(ctx, f, &Arc::new(n.clone()), false);
         }
@@ -729,6 +899,9 @@ impl Renderer {
     /// What `n` draws inside its transparency group (`knockout`: its children knock each other out).
     fn draw_content(&mut self, ctx: &mut RenderContext, f: &Frame, n: &Node, knockout: bool) {
         match &n.kind {
+            NodeKind::Group { children, clip: false } if f.opts.trace_views && !f.opts.outline && n.trace_view() != TraceView::Result => {
+                self.draw_trace_view(ctx, f, children, n.trace_view(), knockout)
+            }
             NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
                 self.draw_children(ctx, f, children, knockout)
             }
@@ -745,6 +918,16 @@ impl Renderer {
                     && let Some(region) = self.clip_of(clip)
                 {
                     let (fill, stroke) = self.clip_paint_of(clip);
+                    // An image inside its own frame painted straight into the clipping path, without
+                    // a clip layer (envelopes cut distorted images into many such pieces).
+                    if let ([image], None, None) = (rest, &fill, &stroke)
+                        && let NodeKind::Image(im) = &image.kind
+                        && plain_image(image, im, &region.0)
+                    {
+                        self.draw_image_in(ctx, f, im, Some(&region));
+                        self.stats.drawn += 1;
+                        return;
+                    }
                     let blends = self.blends_through(n);
                     let bounds = if blends { Some(region.0.bounding_box()) } else { None };
                     let comp = Composite { clip: Some((&region.0, region.1)), blends, bounds, ..Default::default() };
@@ -785,7 +968,28 @@ impl Renderer {
                     self.draw_node(ctx, f, &art, true);
                 }
             }
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) => self.draw_live_node(ctx, f, n),
+            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) => {
+                self.draw_live_node(ctx, f, n)
+            }
+        }
+    }
+
+    /// An Image Trace object's `children` (the hidden source image, then the traced shapes) as
+    /// `view` shows them on screen.
+    fn draw_trace_view(&mut self, ctx: &mut RenderContext, f: &Frame, children: &[Arc<Node>], view: TraceView, knockout: bool) {
+        let Some((source, shapes)) = children.split_first() else { return };
+        if view.shows_source() && matches!(source.kind, NodeKind::Image(_)) {
+            self.draw_node(ctx, f, source, true);
+        }
+        if view.shows_result() {
+            self.draw_children(ctx, f, shapes, knockout);
+        }
+        if view.shows_outlines() {
+            let opts = RenderOptions { outline: true, ..f.opts.clone() };
+            let frame = Frame { opts: &opts, ..*f };
+            for c in shapes {
+                self.draw_node(ctx, &frame, c, false);
+            }
         }
     }
 
@@ -1051,12 +1255,45 @@ impl Renderer {
     }
 
     fn draw_text(&mut self, ctx: &mut RenderContext, f: &Frame, n: &Node, t: &TextObject) {
-        let g = text_geom(t);
+        let t = &*f.doc.inline_resolved(t);
+        let g = text_geom_snapped(t, f.text_snap(t));
         self.draw_text_geom(ctx, f, n, t, &g);
+    }
+
+    /// Draw the inline graphics of type `t` (laid out in `g`): each symbol's art through the
+    /// normal node path, placed by the layout (inside the text's own transparency group, so its
+    /// opacity and blend mode apply). A missing symbol draws nothing.
+    fn draw_inlines(&mut self, ctx: &mut RenderContext, f: &Frame, t: &TextObject, g: &TextGeom) {
+        if g.inlines.is_empty() && !t.runs.iter().any(|r| r.inline.is_some()) {
+            return;
+        }
+        if self.inline_depth >= MAX_INLINE_DEPTH {
+            return;
+        }
+        for r in t.runs.iter().filter_map(|r| r.inline.as_ref()) {
+            if !f.doc.symbols.iter().any(|s| s.name == r.symbol) && !MISSING_INLINE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("inline graphic shows symbol {:?}, which the document doesn't have: it draws nothing", r.symbol);
+            }
+        }
+        self.inline_depth += 1;
+        for ig in &g.inlines {
+            let Some(art) = t.runs.get(ig.run).and_then(|r| r.inline.as_ref()) else { continue };
+            let Some(sym) = f.doc.symbols.iter().find(|s| s.name == art.symbol) else { continue };
+            let mut node = (*sym.art).clone();
+            // Strokes scale with the art (it is sized to the type, as in the SVG `<use>`).
+            node.transform(t.xf * ig.xf * f.doc.symbol_natural_xf(&art.symbol), true);
+            self.draw_node(ctx, f, &node, true);
+        }
+        self.inline_depth -= 1;
     }
 
     /// Cached glyph geometry for a text node (keyed by Arc identity like paths).
     fn text_geom_of(&mut self, a: &Arc<Node>, t: &TextObject) -> Arc<TextGeom> {
+        let fonts = vectorcraft_text::FontDb::global().generation();
+        if fonts != self.text_fonts {
+            self.texts.clear();
+            self.text_fonts = fonts;
+        }
         let key = Arc::as_ptr(a) as usize;
         if let Some((node, g)) = self.texts.get(&key)
             && Arc::ptr_eq(node, a)
@@ -1080,6 +1317,7 @@ impl Renderer {
             ctx.set_stroke(kurbo::Stroke::new(1.0));
             ctx.set_paint(peniko::Color::BLACK);
             ctx.stroke_path(&p);
+            self.draw_inlines(ctx, f, t, g);
             return;
         }
         let tb = t.xf.transform_rect_bbox(g.bounds);
@@ -1102,6 +1340,18 @@ impl Renderer {
         if let Some(all) = &all {
             self.draw_text_items(ctx, f, n, below, all, tb);
         }
+        if f.opts.highlight_substitutions {
+            let setup = &f.doc.setup;
+            for (on, path) in [(setup.highlight_substituted_fonts, &g.substituted_fonts), (setup.highlight_substituted_glyphs, &g.substituted_glyphs)]
+            {
+                if on && !path.elements().is_empty() {
+                    ctx.set_transform(xf);
+                    ctx.set_fill_rule(peniko::Fill::NonZero);
+                    ctx.set_paint(SUBSTITUTED);
+                    ctx.fill_path(path);
+                }
+            }
+        }
         for (i, run) in t.runs.iter().enumerate() {
             let Some(path) = g.runs.get(i) else { continue };
             if path.elements().is_empty() {
@@ -1121,6 +1371,7 @@ impl Renderer {
             }
         }
         overprint(ctx, false);
+        self.draw_inlines(ctx, f, t, g);
         if let Some(all) = &all {
             self.draw_text_items(ctx, f, n, above, all, tb);
         }
@@ -1158,32 +1409,146 @@ impl Renderer {
     }
 
     fn draw_image(&mut self, ctx: &mut RenderContext, f: &Frame, im: &vectorcraft_doc::ImageObject) {
+        self.draw_image_in(ctx, f, im, None);
+    }
+
+    /// Draw an image, or with `area` (a region in the document inside the image's frame, see
+    /// [`plain_image`]) the image painted into that region.
+    fn draw_image_in(&mut self, ctx: &mut RenderContext, f: &Frame, im: &vectorcraft_doc::ImageObject, area: Option<&(BezPath, FillRule)>) {
         let rect = Rect::new(0.0, 0.0, im.width as f64, im.height as f64);
-        if f.opts.outline {
+        // Outline mode draws the image's frame, and with Document Setup → Show Images in Outline
+        // Mode its pixels in greyscale under the frame.
+        let outline = f.opts.outline;
+        // A linked image's preview is cached apart from the file's pixels, which share its key.
+        let cache_key = match f.doc.images.get(&im.key) {
+            Some(b) if b.is_proxy() => std::borrow::Cow::Owned(format!("{}\u{0}proxy", im.key)),
+            _ => std::borrow::Cow::Borrowed(im.key.as_str()),
+        };
+        let pixels = if outline && !f.doc.setup.outline_images { None } else { self.image_pixmap(f.doc, &im.key, &cache_key, outline) };
+        if let Some(pm) = pixels {
+            let pm = if outline { pm } else { self.ink_image(&cache_key, &pm, f.ink, f.doc.images.get(&im.key)) };
+            let sx = im.width as f64 / pm.width().max(1) as f64;
+            let sy = im.height as f64 / pm.height().max(1) as f64;
+            let quality = if f.opts.smooth_images { peniko::ImageQuality::Medium } else { peniko::ImageQuality::Low };
+            let sampler = peniko::ImageSampler { quality, ..Default::default() };
+            ctx.set_paint(vello_cpu::Image { image: vello_cpu::ImageSource::Pixmap(pm), sampler });
+            match area {
+                Some((bp, rule)) => {
+                    ctx.set_transform(f.view);
+                    ctx.set_paint_transform(im.xf * Affine::scale_non_uniform(sx, sy));
+                    ctx.set_fill_rule(fill_rule(*rule));
+                    ctx.fill_path(bp);
+                }
+                None => {
+                    ctx.set_transform(f.view * im.xf);
+                    ctx.set_paint_transform(Affine::scale_non_uniform(sx, sy));
+                    ctx.fill_rect(&rect);
+                }
+            }
+            ctx.reset_paint_transform();
+            // A dimmed layer's images: white over them, so they show at that opacity on paper.
+            if let Some(dim) = self.dim_images.filter(|d| *d < 1.0 && !outline) {
+                ctx.set_paint(f.ink.fixed([255, 255, 255, ((1.0 - dim) * 255.0).round() as u8]));
+                match area {
+                    Some((bp, rule)) => {
+                        ctx.set_transform(f.view);
+                        ctx.set_fill_rule(fill_rule(*rule));
+                        ctx.fill_path(bp);
+                    }
+                    None => {
+                        ctx.set_transform(f.view * im.xf);
+                        ctx.fill_rect(&rect);
+                    }
+                }
+            }
+        }
+        if outline {
             let mut p = rect.to_path(0.1);
             p.apply_affine(im.xf);
             self.hairline(ctx, f, &p, [0, 0, 0, 255]);
+        }
+    }
+
+    /// Cache the pixels of image blob `key` recoloured by `map` as `derived` (the key the adjusted
+    /// art's image takes). The latest ones are kept up to a memory budget: dropping one drops the
+    /// cached art too, so it is made again.
+    fn adjusted_image(&mut self, doc: &Document, key: &str, derived: String, map: &vectorcraft_effects::ColorMap) {
+        const BUDGET: usize = 256 << 20;
+        if self.images.contains_key(&derived) {
             return;
         }
-        let pm = match self.images.get(&im.key) {
+        let Some(src) = self.image_pixmap(doc, key, key, false) else { return };
+        let mut pm = (*src).clone();
+        let mut memo: HashMap<[u8; 4], [u8; 3]> = HashMap::new();
+        for px in pm.data_mut().iter_mut().filter(|p| p.a > 0) {
+            let a = px.a as u32;
+            let [r, g, b] = *memo.entry([px.r, px.g, px.b, px.a]).or_insert_with(|| {
+                // Premultiplied to straight, adjusted, then premultiplied again.
+                let straight = [px.r, px.g, px.b].map(|v| ((v as u32 * 255 + a / 2) / a).min(255) as u8);
+                map.apply_rgb8(straight).map(|v| ((v as u32 * a + 127) / 255) as u8)
+            });
+            (px.r, px.g, px.b) = (r, g, b);
+        }
+        let bytes = pm.data().len() * 4;
+        self.images.insert(derived.clone(), Arc::new(pm));
+        self.adjusted.push_back((derived, bytes));
+        let mut total: usize = self.adjusted.iter().map(|(_, b)| b).sum();
+        while total > BUDGET && self.adjusted.len() > 1 {
+            let Some((old, b)) = self.adjusted.pop_front() else { break };
+            self.images.remove(&old);
+            self.fx_arts.clear();
+            total -= b;
+        }
+    }
+
+    /// The decoded pixels of image blob `key` (cached as `cache_key`), or a greyscale copy of them.
+    fn image_pixmap(&mut self, doc: &Document, key: &str, cache_key: &str, grey: bool) -> Option<Arc<Pixmap>> {
+        let colour = match self.images.get(cache_key) {
             Some(p) => p.clone(),
             None => {
-                let Some(blob) = f.doc.images.get(&im.key) else { return };
-                let Some(pm) = paint::decode_pixmap(&blob.bytes) else { return };
-                let pm = Arc::new(pm);
-                self.images.insert(im.key.clone(), pm.clone());
-                pm
+                let blob = doc.images.get(key)?;
+                match self.cmyk_image(blob, cache_key) {
+                    Some(pm) => pm,
+                    None => {
+                        let pm = Arc::new(paint::decode_pixmap(&blob.bytes)?);
+                        self.images.insert(cache_key.to_string(), pm.clone());
+                        pm
+                    }
+                }
             }
         };
-        let pm = self.ink_image(&im.key, &pm, f.ink);
-        let sx = im.width as f64 / pm.width().max(1) as f64;
-        let sy = im.height as f64 / pm.height().max(1) as f64;
-        ctx.set_transform(f.view * im.xf);
-        ctx.set_paint(vello_cpu::Image { image: vello_cpu::ImageSource::Pixmap(pm), sampler: peniko::ImageSampler::default() });
-        ctx.set_paint_transform(Affine::scale_non_uniform(sx, sy));
-        ctx.fill_rect(&rect);
-        ctx.reset_paint_transform();
+        if !grey {
+            return Some(colour);
+        }
+        let grey_key = format!("{cache_key}\u{0}grey");
+        if let Some(p) = self.images.get(&grey_key) {
+            return Some(p.clone());
+        }
+        let mut pm = (*colour).clone();
+        for px in pm.data_mut() {
+            // The luma of premultiplied components is the premultiplied luma.
+            let l = (0.2126 * px.r as f32 + 0.7152 * px.g as f32 + 0.0722 * px.b as f32 + 0.5) as u8;
+            (px.r, px.g, px.b) = (l, l, l);
+        }
+        let pm = Arc::new(pm);
+        self.images.insert(grey_key, pm.clone());
+        Some(pm)
     }
+}
+
+/// Can image node `n` (`im`) clipped by `region` be painted straight into the region: visible,
+/// with no transparency, effects or paint of its own, and the region inside the image's frame
+/// (within a pixel), so no paint past the image's edge shows?
+fn plain_image(n: &Node, im: &vectorcraft_doc::ImageObject, region: &BezPath) -> bool {
+    if !(n.visible && n.has_default_transparency() && n.appearance.items.is_empty() && n.appearance.effects.is_empty()) {
+        return false;
+    }
+    let det = im.xf.determinant();
+    if !(det.abs() > 1e-12 && det.is_finite()) {
+        return false;
+    }
+    let b = im.xf.inverse().transform_rect_bbox(region.bounding_box());
+    b.x0 >= -1.0 && b.y0 >= -1.0 && b.x1 <= im.width as f64 + 1.0 && b.y1 <= im.height as f64 + 1.0
 }
 
 /// Opacity-mask coverage of one premultiplied pixel: luminance, with the area outside the mask
@@ -1261,19 +1626,63 @@ struct TextGeom {
     runs: Vec<BezPath>,
     all: BezPath,
     bounds: Rect,
+    /// The boxes of characters whose font is missing (drawn in a substitute), and of glyphs the
+    /// font lacks (drawn from a fallback font): Document Setup's substitution highlights.
+    substituted_fonts: BezPath,
+    substituted_glyphs: BezPath,
+    /// Inline graphics placed by the layout.
+    inlines: Vec<vectorcraft_text::InlineGlyph>,
 }
 
 fn text_geom(t: &TextObject) -> TextGeom {
-    let layout = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), t);
+    text_geom_snapped(t, None)
+}
+
+/// Glyph geometry of `t`; `snap` (text space → device pixels) puts the glyphs on whole pixels.
+fn text_geom_snapped(t: &TextObject, snap: Option<Affine>) -> TextGeom {
+    let db = vectorcraft_text::FontDb::global();
+    let mut layout = vectorcraft_text::layout(db, t);
+    if let Some(xf) = snap {
+        layout.snap_to_pixels(xf);
+    }
     let mut runs = vec![BezPath::new(); t.runs.len()];
     let mut all = BezPath::new();
+    // Per run: is its family missing, and the face its glyphs should come from.
+    let faces: Vec<(bool, Option<u32>)> = t
+        .runs
+        .iter()
+        .map(|r| match db.resolve(&r.style.font_family, &r.style.font_style) {
+            Some((f, m)) => (m == vectorcraft_text::FontMatch::Missing, Some(f.id())),
+            None => (true, None),
+        })
+        .collect();
+    let (mut substituted_fonts, mut substituted_glyphs) = (BezPath::new(), BezPath::new());
     for g in &layout.glyphs {
         if let Some(r) = runs.get_mut(g.run) {
             r.extend(g.outline.iter());
         }
         all.extend(g.outline.iter());
+        let Some(&(missing, face)) = faces.get(g.run) else { continue };
+        let target = if missing {
+            &mut substituted_fonts
+        } else if face.is_some_and(|f| f != g.font_id) {
+            &mut substituted_glyphs
+        } else {
+            continue;
+        };
+        let Some(line) = layout.lines.get(g.line) else { continue };
+        let mut cell = Rect::new(g.origin.x, g.origin.y - line.ascent, g.origin.x + g.advance, g.origin.y + line.descent).to_path(0.1);
+        cell.apply_affine(Affine::rotate_about(g.angle, g.origin));
+        target.extend(cell.iter());
     }
-    TextGeom { runs, all, bounds: layout.bounds }
+    TextGeom { runs, all, bounds: layout.bounds, substituted_fonts, substituted_glyphs, inlines: layout.inlines }
+}
+
+/// Document Setup's highlight behind substituted fonts and glyphs (screen only).
+const SUBSTITUTED: peniko::Color = peniko::Color::from_rgba8(255, 120, 190, 110);
+/// The pixel size of `region` rendered at `scale` pixels per point (at least 1×1).
+pub fn region_pixels(region: Rect, scale: f64) -> (u32, u32) {
+    ((region.width() * scale).round().max(1.0) as u32, (region.height() * scale).round().max(1.0) as u32)
 }
 
 fn rects_overlap(a: Rect, b: Rect) -> bool {
@@ -1323,6 +1732,8 @@ fn now() -> u64 {
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_adjust;
+#[cfg(test)]
 mod tests_blend;
 #[cfg(test)]
 mod tests_charstroke;
@@ -1333,13 +1744,21 @@ mod tests_cmykblend;
 #[cfg(test)]
 mod tests_container;
 #[cfg(test)]
+mod tests_fontchange;
+#[cfg(test)]
 mod tests_freeform;
 #[cfg(test)]
 mod tests_isolation;
 #[cfg(test)]
 mod tests_knockout;
 #[cfg(test)]
+mod tests_layeropts;
+#[cfg(test)]
 mod tests_objectfx;
+#[cfg(test)]
+mod tests_placed_document;
+#[cfg(test)]
+mod tests_setup;
 #[cfg(test)]
 mod tests_strokegradient;
 #[cfg(test)]

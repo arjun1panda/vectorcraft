@@ -26,15 +26,21 @@ fn align_id(a: TabAlign) -> &'static str {
     }
 }
 
-/// The first selected text object's stops and the ruler span in points (the frame width for area type).
+/// The stops of the caret's paragraph while the Type tool edits text (else the first selected text
+/// object's first paragraph) and the ruler span in points (the frame width for area type).
 fn current(app: &VectorcraftApp) -> Option<(Vec<TabStop>, f64)> {
-    let n = first_selected(app)?;
+    let editing = super::character::text_editing(app);
+    let n = match editing {
+        Some((id, _, _)) => app.session.active()?.doc.node(id)?.clone(),
+        None => first_selected(app)?,
+    };
     let NodeKind::Text(t) = &n.kind else { return None };
+    let para = editing.map_or(0, |(_, a, _)| t.paragraphs_in(a, a).start);
     let span = match &t.kind {
         vectorcraft_doc::TextKind::Area { frame } => frame.bounds().map_or(360.0, |b| b.width()),
         _ => 360.0,
     };
-    Some((t.para.tabs.clone(), span.max(72.0)))
+    Some((t.para_at(para).tabs.clone(), span.max(72.0)))
 }
 
 fn stops_json(stops: &[TabStop]) -> Value {
@@ -47,9 +53,9 @@ fn stops_json(stops: &[TabStop]) -> Value {
 }
 
 fn apply(app: &mut VectorcraftApp, stops: &[TabStop]) {
-    if let Some((id, _, _)) = super::character::text_editing(app) {
+    if let Some((id, a, b)) = super::character::text_editing(app) {
         super::character::end_typing(app);
-        app.run("text.tabs.set", json!({"stops": stops_json(stops), "ids": [id.0]})).ok();
+        app.run("text.tabs.set", json!({"stops": stops_json(stops), "ids": [id.0], "start": a, "end": b})).ok();
     } else {
         app.run("text.tabs.set", json!({"stops": stops_json(stops)})).ok();
     }
@@ -58,7 +64,7 @@ fn apply(app: &mut VectorcraftApp, stops: &[TabStop]) {
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     let Some((mut stops, span)) = current(app) else {
-        super::empty_state(ui, "pilcrow", "No text selected", "Select a text object to set its tab stops.");
+        super::empty_state(ui, "pilcrow", tl!("No text selected"), tl!("Select a text object to set its tab stops."));
         return;
     };
     let mut sel: usize = pstate(ui.ctx(), "tabs-sel");
@@ -70,7 +76,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         ui.spacing_mut().item_spacing.x = 3.0;
         for (i, (a, label, tip)) in ALIGNS.iter().enumerate() {
             let on = stops.get(sel).map_or(align_idx == i, |s| s.align == *a);
-            if ui.add(egui::Button::new(egui::RichText::new(*label).size(13.0)).selected(on).min_size(vec2(28.0, 24.0))).on_hover_text(*tip).clicked()
+            if ui
+                .add(egui::Button::new(egui::RichText::new(*label).size(13.0)).selected(on).min_size(vec2(28.0, 24.0)))
+                .on_hover_text(tl!(*tip))
+                .clicked()
             {
                 align_idx = i;
                 set_pstate(ui.ctx(), "tabs-align", i);
@@ -93,7 +102,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             apply(app, &stops);
         }
         ui.end_row();
-        ui.label(egui::RichText::new("Leader:").color(t.text));
+        ui.label(egui::RichText::new(tl!("Leader:")).color(t.text));
         let mut leader = stops.get(sel).map(|s| s.leader.clone()).unwrap_or_default();
         if ui.add_enabled(stops.get(sel).is_some(), egui::TextEdit::singleline(&mut leader).desired_width(90.0)).lost_focus()
             && let Some(s) = stops.get_mut(sel)
@@ -103,7 +112,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             apply(app, &stops);
         }
         ui.end_row();
-        ui.label(egui::RichText::new("Align On:").color(t.text));
+        ui.label(egui::RichText::new(tl!("Align On:")).color(t.text));
         let decimal = stops.get(sel).is_some_and(|s| s.align == TabAlign::Decimal);
         let mut on = stops.get(sel).map(|s| s.align_on.to_string()).unwrap_or_else(|| ".".into());
         if ui.add_enabled(decimal, egui::TextEdit::singleline(&mut on).desired_width(30.0)).lost_focus()
@@ -196,24 +205,24 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             }
         }
     }
-    resp.on_hover_text("Click to add a tab stop, drag to move it, drag it off the ruler to delete it");
+    resp.on_hover_text(tl!("Click to add a tab stop, drag to move it, drag it off the ruler to delete it"));
 }
 
 pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let Some((mut stops, _)) = current(app) else {
-        ui.add_enabled(false, egui::Button::new("Select text").frame(false));
+        ui.add_enabled(false, egui::Button::new(tl!("Select text")).frame(false));
         return;
     };
     let sel: usize = pstate(ui.ctx(), "tabs-sel");
-    if menu_item(ui, "Clear All Tabs", false, !stops.is_empty()) {
-        app.run("text.tabs.clear", json!({})).ok();
+    if menu_item(ui, tl!("Clear All Tabs"), false, !stops.is_empty()) {
+        apply(app, &[]);
     }
-    if menu_item(ui, "Delete Tab", false, sel < stops.len()) {
+    if menu_item(ui, tl!("Delete Tab"), false, sel < stops.len()) {
         stops.remove(sel);
         apply(app, &stops);
     }
     // Repeat Tab: copies of the selected stop at its distance from the previous one, across the ruler.
-    if menu_item(ui, "Repeat Tab", false, sel < stops.len()) {
+    if menu_item(ui, tl!("Repeat Tab"), false, sel < stops.len()) {
         let prev = if sel == 0 { 0.0 } else { stops[sel - 1].position };
         let step = (stops[sel].position - prev).max(1.0);
         let base = stops[sel].clone();

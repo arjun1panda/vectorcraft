@@ -6,19 +6,41 @@
 #![forbid(unsafe_code)]
 
 pub mod appearance;
+pub mod assets;
+pub mod blend;
+pub mod clipnest;
+pub mod cmyk;
+pub mod corners;
 pub mod graph;
 pub mod hit;
+pub mod inks;
+mod inline;
+pub use inline::{SYMBOL_HALF, SYMBOL_SIZES};
+pub mod links;
 pub mod live;
 pub mod marks;
+pub mod metadata;
 pub mod node;
+pub mod orient;
 pub mod overprint;
 pub mod pattern;
+pub mod perspective;
 mod pixels;
+pub mod placed_document;
+pub mod profiles;
+pub mod puppet;
+pub mod range;
+pub mod rastersettings;
 mod reach;
+pub mod recolor;
 pub mod selection;
+pub mod setup;
+pub mod shaper;
+pub mod slices;
 pub mod style_libs;
 pub mod swatches;
 pub mod text;
+pub mod trace;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -41,26 +63,40 @@ pub use appearance::{
     Appearance, AppearanceItem, ArrowAlign, Arrowhead, Dash, Effect, FillLayer, LineCap, LineJoin, ProfilePreset, SavedProfile, StrokeAlign,
     StrokeLayer, WidthProfile,
 };
+pub use assets::ExportAsset;
+pub use corners::LiveCorners;
 pub use graph::{GraphKind, GraphSpec};
 pub use hit::{Hit, HitKind};
+pub use links::{LinkInfo, PlacementOptions};
 pub use live::{BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, GradientMesh, MeshPoint};
+pub use metadata::{CopyrightStatus, DocMetadata};
 pub use node::Knockout;
 pub use node::Scaling;
 pub use node::{ImageMap, ObjectAttributes};
 pub use node::{ImageObject, LAYER_COLORS, LayerColor, LiveShape, Node, NodeId, NodeKind, OpacityMask};
+pub use orient::OrientedBox;
 pub use pattern::{Overlap, PatternDef, PatternEdit, RepeatKind, RepeatSpec, TileType};
+pub use perspective::PerspectiveAttachment;
+pub use placed_document::PlacedDocument;
+pub use profiles::ColorProfiles;
+pub use puppet::{PuppetPin, PuppetPins};
+pub use rastersettings::{RasterColorModel, RasterEffectsSettings};
 pub use selection::{AnchorRef, Selection};
+pub use setup::{Background, DocSetup, ExportText, GridSize, Quotes};
+pub use slices::{CellAlign, CellVAlign, Slice, SliceArea, SliceKind, SliceOptions, SliceSource};
 pub use style_libs::StyleLibrary;
 pub use text::{
-    AreaOptions, CharStyle, FirstBaseline, Justify, ParaStyle, PathEffect, TabAlign, TabStop, TextKind, TextObject, TextRun, TextStyleDef, TextWrap,
-    WrapShape,
+    AreaFit, AreaOptions, Burasagari, CharAlign, CharPosition, CharStyle, Composer, FirstBaseline, InlineArt, Justify, LeadingModel, Mojikumi,
+    ParaDirection, ParaStyle, PathAlign, PathEffect, ScriptMetrics, TabAlign, TabStop, TextKind, TextObject, TextRun, TextStyleDef, TextWrap,
+    VerticalAlign, WrapShape,
 };
+pub use trace::TraceView;
 pub use vectorcraft_color as color;
 pub use vectorcraft_geom as geom;
 
 use serde::{Deserialize, Serialize};
 use vectorcraft_color::{Swatch, SwatchGroup};
-use vectorcraft_geom::{Point, Rect};
+use vectorcraft_geom::{Point, Rect, Vec2};
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum DocError {
@@ -141,6 +177,18 @@ impl Unit {
             Unit::Feet => "Feet",
         }
     }
+    /// The rulers' label step at `zoom` (screen pixels per point), in this unit: the first of
+    /// 1, 2, 5 × 10ⁿ that puts labels at least 50 pixels apart. Ticks mark every tenth of it.
+    pub fn ruler_step(self, zoom: f64) -> f64 {
+        const STEPS: [f64; 19] =
+            [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0];
+        STEPS.iter().copied().find(|s| s * self.points() * zoom >= 50.0).unwrap_or(10000.0)
+    }
+    /// `v` (points) on the nearest ruler tick at `zoom` ([`Self::ruler_step`]).
+    pub fn snap_to_ruler_tick(self, v: f64, zoom: f64) -> f64 {
+        let tick = self.ruler_step(zoom) / 10.0 * self.points();
+        (v / tick).round() * tick
+    }
     pub fn from_pt(self, v: f64) -> f64 {
         v / self.points()
     }
@@ -153,13 +201,19 @@ impl Unit {
     }
     /// [`Unit::format`] without the suffix (`12.5`), for narrow fields.
     pub fn number(self, pt: f64) -> String {
-        let s = format!("{:.3}", self.from_pt(pt));
+        // Three decimals for the small units (`595.276 pt`), four for the large ones (`8.2677 in`,
+        // `35.2778 mm`, the `0.0078 in` stroke preset); trailing zeros are trimmed (`1 pt` is `1`).
+        let decimals = if matches!(self, Unit::Points | Unit::Pixels | Unit::Picas) { 3 } else { 4 };
+        let s = format!("{:.*}", decimals, self.from_pt(pt));
         let s = s.trim_end_matches('0').trim_end_matches('.');
         if s == "-0" { "0".into() } else { s.into() }
     }
     /// Parse `12`, `12pt`, `1in`, `3 mm`, `2p6` (picas+points), simple `+ - * /` arithmetic.
+    ///
+    /// A unit after a `*` or `/` operand measures the whole expression (`1080/2 px` is 540 px), so
+    /// math typed before a field's unit suffix works.
     pub fn parse(self, s: &str) -> Option<f64> {
-        parse_measure(s, self)
+        parse_measure(s, self).filter(|v| v.is_finite())
     }
     /// The value naming this unit in the Units preferences (`points`, `millimeters`,
     /// `feetInches`).
@@ -202,14 +256,20 @@ fn parse_measure(s: &str, default: Unit) -> Option<f64> {
             if l.trim().is_empty() {
                 continue;
             }
-            let a = parse_measure(l, default)?;
             return match op {
-                '+' => Some(a + parse_measure(r, default)?),
-                '-' => Some(a - parse_measure(r, default)?),
-                '*' => Some(a * r.trim().parse::<f64>().ok()?),
+                '+' => Some(parse_measure(l, default)? + parse_measure(r, default)?),
+                '-' => Some(parse_measure(l, default)? - parse_measure(r, default)?),
                 _ => {
-                    let d = r.trim().parse::<f64>().ok()?;
-                    if d == 0.0 { None } else { Some(a / d) }
+                    // A factor or divisor is a plain number; a unit after it is the expression's.
+                    let (k, unit) = number_unit(r)?;
+                    let a = parse_measure(l, unit.unwrap_or(default))?;
+                    if op == '*' {
+                        Some(a * k)
+                    } else if k == 0.0 {
+                        None
+                    } else {
+                        Some(a / k)
+                    }
                 }
             };
         }
@@ -223,22 +283,40 @@ fn parse_measure(s: &str, default: Unit) -> Option<f64> {
     {
         return Some(p.trim().parse::<f64>().ok()? * 12.0 + pt.trim().parse::<f64>().unwrap_or(0.0));
     }
+    let (v, unit) = number_unit(s)?;
+    Some(unit.unwrap_or(default).to_pt(v))
+}
+
+/// A number with an optional unit suffix (`12`, `3 mm`, `2in`) → (the number, its unit).
+fn number_unit(s: &str) -> Option<(f64, Option<Unit>)> {
+    let s = s.trim();
     let num_end = s.find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-')).unwrap_or(s.len());
-    let v: f64 = s[..num_end].trim().parse().ok()?;
-    let unit = match s[num_end..].trim() {
-        "" => default,
-        "pt" => Unit::Points,
-        "px" => Unit::Pixels,
-        "in" | "\"" => Unit::Inches,
-        "mm" => Unit::Millimeters,
-        "cm" => Unit::Centimeters,
-        "m" => Unit::Meters,
-        "ft" | "'" => Unit::Feet,
-        "yd" => Unit::Yards,
-        "pc" => Unit::Picas,
+    let v: f64 = s.get(..num_end)?.trim().parse().ok()?;
+    let unit = match s.get(num_end..)?.trim() {
+        "" => None,
+        "pt" => Some(Unit::Points),
+        "px" => Some(Unit::Pixels),
+        "in" | "\"" => Some(Unit::Inches),
+        "mm" => Some(Unit::Millimeters),
+        "cm" => Some(Unit::Centimeters),
+        "m" => Some(Unit::Meters),
+        "ft" | "'" => Some(Unit::Feet),
+        "yd" => Some(Unit::Yards),
+        "p" | "pc" => Some(Unit::Picas),
         _ => return None,
     };
-    Some(unit.to_pt(v))
+    Some((v, unit))
+}
+
+/// A unitless field value (percent, degrees, counts) with the same `+ - * /` arithmetic as
+/// [`Unit::parse`] (`45*2`, `100/3`); text other than digits, `.` and operators reads as nothing.
+pub fn parse_number(s: &str) -> Option<f64> {
+    if !s.chars().all(|c| c.is_ascii_digit() || " .+-*/".contains(c)) {
+        return None;
+    }
+    // A leading `+` is a sign (`+5`), as a plain number read it.
+    let s = s.trim();
+    Unit::Points.parse(s.strip_prefix('+').unwrap_or(s))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,11 +365,53 @@ pub struct SavedView {
     pub rotation: f64,
 }
 
+/// A saved selection (Select → Save Selection…): the objects that were selected, listed by name at
+/// the bottom of the Select menu.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedSelection {
+    pub name: String,
+    pub objects: Vec<NodeId>,
+}
+
+impl SavedSelection {
+    /// Most saved selections a document keeps (the Select menu lists every one).
+    pub const MAX: usize = 25;
+    /// Longest name, in characters.
+    pub const MAX_NAME: usize = 255;
+
+    /// `name` trimmed and cut to [`Self::MAX_NAME`] characters (`None` when blank).
+    pub fn clean_name(name: &str) -> Option<String> {
+        let name: String = name.trim().chars().take(Self::MAX_NAME).collect();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// The first "Selection N" none of `saved` is named.
+    pub fn default_name(saved: &[SavedSelection]) -> String {
+        (1..=saved.len() + 1).map(|i| format!("Selection {i}")).find(|n| !saved.iter().any(|x| &x.name == n)).unwrap_or_default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Guide {
     /// true = vertical guide at `pos` (x), false = horizontal at `pos` (y).
     pub vertical: bool,
     pub pos: f64,
+    /// An artboard guide: the [`Artboard::id`] it belongs to. It runs across that artboard only
+    /// and moves, is copied and is deleted with it. None: a canvas guide, across the whole canvas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artboard: Option<u32>,
+}
+
+impl Guide {
+    /// A canvas guide.
+    pub fn new(vertical: bool, pos: f64) -> Self {
+        Self { vertical, pos, artboard: None }
+    }
+
+    /// Moved by `d` (a vertical guide across, a horizontal one down).
+    pub fn moved(&self, d: Vec2) -> Self {
+        Self { pos: self.pos + if self.vertical { d.x } else { d.y }, ..self.clone() }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -395,6 +515,10 @@ pub struct ImageBlob {
     pub mime: String,
     #[serde(skip)]
     pub bytes: Arc<Vec<u8>>,
+    /// A linked image's low-resolution preview (PNG, see [`links`]): what a save writes when only
+    /// linked images show this blob, and what `bytes` hold while the linked file can't be read.
+    #[serde(skip)]
+    pub proxy: Option<Arc<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -434,6 +558,9 @@ pub struct Document {
     /// View → New View… (up to 25, like Illustrator).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub views: Vec<SavedView>,
+    /// Select → Save Selection… (at most [`SavedSelection::MAX`]); saved with the document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub saved_selections: Vec<SavedSelection>,
     #[serde(default)]
     pub grid: GridPrefs,
     #[serde(default = "ppi72")]
@@ -467,6 +594,60 @@ pub struct Document {
     /// ([`Document::linked_color`]).
     #[serde(default = "yes", skip_serializing_if = "skip::is_true")]
     pub spot_use_lab: bool,
+    /// File → Document Setup (bleed, transparency grid, paper, type options).
+    #[serde(default, skip_serializing_if = "skip::is_default")]
+    pub setup: DocSetup,
+    /// Layers panel → Paste Remembers Layers: pasted objects go back into the layers (by name)
+    /// they were copied from instead of the current layer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paste_remembers_layers: bool,
+    /// File → File Info (the title is [`Document::title`]).
+    #[serde(default, skip_serializing_if = "skip::is_default")]
+    pub metadata: DocMetadata,
+    /// Effect → Document Raster Effects Settings besides the resolution
+    /// ([`Document::raster_effects_ppi`]).
+    #[serde(default, skip_serializing_if = "skip::is_default")]
+    pub raster_effects: RasterEffectsSettings,
+    /// The view (zoom, centre, rotation) the document was saved with; it reopens there. Written at
+    /// save time only, so changing the view never marks the document modified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_view: Option<SavedView>,
+    /// The layers, sublayers and groups open in the Layers panel when the document was saved; they
+    /// reopen that way. `None`: the default, only the top-level layers open. Written at save time
+    /// only, like [`Document::last_view`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers_open: Option<Vec<NodeId>>,
+    /// Edit → Assign Profile: the profiles the document is tagged with (files before format v3
+    /// kept them in `unknown`, see [`Document::migrate_color_profiles`]).
+    #[serde(default, skip_serializing_if = "ColorProfiles::is_empty")]
+    pub color_profiles: ColorProfiles,
+    /// File → Export for Screens: the settings it last exported with (`document.exportForScreens`
+    /// params), so the dialog reopens on them.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub export_settings: serde_json::Map<String, serde_json::Value>,
+    /// Top-level keys this version doesn't know (written by a newer one), kept so saving doesn't
+    /// lose them. Separate from [`Document::unknown`], which holds foreign data by design.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+    /// User slices (Slice tool, Object → Slice); object slices are [`Node::slice`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<Slice>,
+    /// Object → Slice → Clip to Artboard: slices are clipped to the artboards and auto slices fill
+    /// them (on, the default); off, auto slices cover the art and the slices.
+    #[serde(default = "yes", skip_serializing_if = "skip::is_true")]
+    pub slices_clip_to_artboard: bool,
+    /// File → Print: the print settings saved with the document (`vectorcraft_pdf::PrintSettings`
+    /// as JSON: the print engine sits above this crate); `None` until they are set up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub print_setup: Option<serde_json::Value>,
+    /// Window → Asset Export: art collected for export ([`ExportAsset`]), in panel order. Their
+    /// export settings are Export for Screens' ([`Document::export_settings`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<ExportAsset>,
+    /// Puppet Warp pins on the selected artwork while the tool edits it ([`PuppetPins`]): editing
+    /// state, never saved.
+    #[serde(skip)]
+    pub puppet: Option<Arc<PuppetPins>>,
 }
 
 fn ppi72() -> f64 {
@@ -511,6 +692,7 @@ impl Document {
             symbols: vec![],
             guides: vec![],
             views: vec![],
+            saved_selections: vec![],
             grid: GridPrefs::default(),
             raster_effects_ppi: 72.0,
             images: BTreeMap::new(),
@@ -522,6 +704,20 @@ impl Document {
             page_isolate: false,
             page_knockout: false,
             spot_use_lab: true,
+            setup: DocSetup::default(),
+            paste_remembers_layers: false,
+            metadata: DocMetadata::default(),
+            raster_effects: RasterEffectsSettings::default(),
+            last_view: None,
+            layers_open: None,
+            color_profiles: ColorProfiles::default(),
+            export_settings: Default::default(),
+            extra: Default::default(),
+            slices: vec![],
+            slices_clip_to_artboard: true,
+            print_setup: None,
+            assets: vec![],
+            puppet: None,
         };
         let id = d.alloc_id();
         d.layers.push(Arc::new(Node::layer(id, "Layer 1", LayerColor::Preset(0))));
@@ -543,6 +739,8 @@ impl Document {
         for l in &self.layers {
             l.walk(&mut |n| max = max.max(n.id.0));
         }
+        max = self.slices.iter().fold(max, |m, s| m.max(s.id.0));
+        max = self.assets.iter().fold(max, |m, a| m.max(a.id));
         self.next_id = self.next_id.max(max + 1);
     }
 
@@ -690,15 +888,17 @@ impl Document {
         self.layers.push(Arc::new(Node::layer(id, &name, LayerColor::Preset((n % LAYER_COLORS.len()) as u8))));
         id
     }
+    /// The default name of a new layer or sublayer, "Layer N". Layers and sublayers share the
+    /// numbering: it starts after the number of layers there are and skips any layer's name.
     pub fn next_layer_name(&self) -> String {
-        let mut i = self.layers.len() + 1;
-        loop {
-            let name = format!("Layer {i}");
-            if !self.layers.iter().any(|l| l.name.as_deref() == Some(&name)) {
-                return name;
+        let (mut count, mut taken) = (0, std::collections::HashSet::new());
+        self.walk(|n| {
+            if n.is_layer() {
+                count += 1;
+                taken.extend(n.name.as_deref());
             }
-            i += 1;
-        }
+        });
+        (count + 1..).map(|i| format!("Layer {i}")).find(|name| !taken.contains(name.as_str())).unwrap_or_default()
     }
 
     /// Visit every node depth first in paint order (bottom to top).
@@ -717,9 +917,19 @@ impl Document {
     pub fn is_visible(&self, id: NodeId) -> bool {
         self.ancestry(id).is_some_and(|a| a.iter().all(|i| self.node(*i).is_some_and(|n| n.visible)))
     }
-    /// Colour of the layer containing `id` (selection highlight colour).
+    /// The innermost layer or sublayer containing `id` (`id` itself when it is a layer).
+    pub fn layer_containing(&self, id: NodeId) -> Option<NodeId> {
+        let a = self.ancestry(id)?;
+        a.iter().rev().copied().find(|i| self.node(*i).is_some_and(Node::is_layer))
+    }
+    /// Every art object the Selection tool can reach (Select All): the visible, unlocked objects
+    /// of the visible, unlocked, non-template layers, looking through sublayers (bottom first).
+    pub fn selectable_art(&self) -> Vec<NodeId> {
+        self.layers.iter().filter(|l| l.visible && !l.locked && !l.is_template()).flat_map(|l| l.layer_art(true)).collect()
+    }
+    /// Colour of the innermost layer or sublayer containing `id` (selection highlight colour).
     pub fn layer_color(&self, id: NodeId) -> [u8; 3] {
-        let l = self.layer_of(id).and_then(|l| self.node(l));
+        let l = self.layer_containing(id).and_then(|l| self.node(l));
         match l.map(|n| &n.kind) {
             Some(NodeKind::Layer { color, .. }) => color.rgb(),
             _ => LAYER_COLORS[0].1,
@@ -738,6 +948,70 @@ impl Document {
     /// Artboard index containing point `p` (topmost = last).
     pub fn artboard_at(&self, p: Point) -> Option<usize> {
         self.artboards.iter().rposition(|a| a.rect.contains(p))
+    }
+    /// The art that moves with an artboard at `rect`: top-level objects (children of layers and
+    /// sublayers) lying entirely inside it. Locked and hidden objects and layers stay put unless
+    /// `locked_and_hidden` (Selection & Anchor Display › Move Locked and Hidden Artwork with
+    /// Artboard).
+    pub fn art_on_artboard(&self, rect: Rect, locked_and_hidden: bool) -> Vec<NodeId> {
+        fn collect(n: &Node, rect: Rect, all: bool, out: &mut Vec<NodeId>) {
+            for c in n.children().into_iter().flatten().filter(|c| c.rides_with_artboard(all)) {
+                if c.is_layer() {
+                    collect(c, rect, all, out);
+                } else if let Some(b) = c.geometric_bounds()
+                    && rect.contains(Point::new(b.x0, b.y0))
+                    && rect.contains(Point::new(b.x1, b.y1))
+                {
+                    out.push(c.id);
+                }
+            }
+        }
+        let mut art = vec![];
+        for l in self.layers.iter().filter(|l| l.rides_with_artboard(locked_and_hidden)) {
+            collect(l, rect, locked_and_hidden, &mut art);
+        }
+        art
+    }
+    /// Where ruler guide `g` runs along its line (the y range of a vertical guide): across its
+    /// artboard for an artboard guide, None (the whole canvas) for a canvas guide or one whose
+    /// artboard is gone.
+    pub fn guide_span(&self, g: &Guide) -> Option<(f64, f64)> {
+        let r = self.artboards.iter().find(|a| Some(a.id) == g.artboard)?.rect;
+        Some(if g.vertical { (r.y0, r.y1) } else { (r.x0, r.x1) })
+    }
+    /// Does ruler guide `g` run past `p` (up to `tol` beyond its ends)?
+    pub fn guide_passes(&self, g: &Guide, p: Point, tol: f64) -> bool {
+        let along = if g.vertical { p.y } else { p.x };
+        self.guide_span(g).is_none_or(|(a, b)| along >= a - tol && along <= b + tol)
+    }
+    /// Keep the ruler guides `keep` accepts (by index), the selected ones left keeping their
+    /// place among the rest (the selected art stays selected). Returns how many went.
+    pub fn retain_guides(&mut self, sel: &mut Selection, keep: impl Fn(usize, &Guide) -> bool) -> usize {
+        let kept: Vec<bool> = self.guides.iter().enumerate().map(|(i, g)| keep(i, g)).collect();
+        // Where each kept guide ends up.
+        let (mut to, mut n) = (Vec::with_capacity(kept.len()), 0);
+        for k in &kept {
+            to.push(k.then_some(n));
+            n += usize::from(*k);
+        }
+        sel.guides = sel.guides.iter().filter_map(|i| to.get(*i).copied().flatten()).collect();
+        let before = self.guides.len();
+        let mut flags = kept.into_iter();
+        self.guides.retain(|_| flags.next().unwrap_or(true));
+        before - self.guides.len()
+    }
+    /// Move the guides of artboard `id` by `d` (along with their artboard).
+    pub fn move_artboard_guides(&mut self, id: u32, d: Vec2) {
+        for g in self.guides.iter_mut().filter(|g| g.artboard == Some(id)) {
+            *g = g.moved(d);
+        }
+    }
+    /// Copy the guides of artboard `from` onto artboard `to`, `d` away (with a copy of their
+    /// artboard).
+    pub fn copy_artboard_guides(&mut self, from: u32, to: u32, d: Vec2) {
+        let copies: Vec<Guide> =
+            self.guides.iter().filter(|g| g.artboard == Some(from)).map(|g| Guide { artboard: Some(to), ..g.moved(d) }).collect();
+        self.guides.extend(copies);
     }
     pub fn next_artboard_id(&self) -> u32 {
         self.artboards.iter().map(|a| a.id).max().unwrap_or(0) + 1
@@ -761,6 +1035,33 @@ impl Document {
 }
 
 impl Document {
+    /// Saved selections as a file gives them, made safe to list and recall: at most
+    /// [`SavedSelection::MAX`], each with a clean, unique name and naming objects this document
+    /// has, each once. (An id it doesn't have would select whatever object takes that id later.)
+    pub fn tidy_saved_selections(&mut self) {
+        if self.saved_selections.is_empty() {
+            return;
+        }
+        let mut ids = std::collections::HashSet::new();
+        self.walk(|n| {
+            ids.insert(n.id);
+        });
+        let mut kept: Vec<SavedSelection> = vec![];
+        for s in std::mem::take(&mut self.saved_selections) {
+            if kept.len() >= SavedSelection::MAX {
+                break;
+            }
+            let Some(name) = SavedSelection::clean_name(&s.name) else { continue };
+            if kept.iter().any(|k| k.name == name) {
+                continue;
+            }
+            let mut seen = std::collections::HashSet::new();
+            let objects = s.objects.into_iter().filter(|id| ids.contains(id) && seen.insert(*id)).collect();
+            kept.push(SavedSelection { name, objects });
+        }
+        self.saved_selections = kept;
+    }
+
     /// Leave opacity-mask editing: drop the temporary editing layer, a working copy of art the
     /// mask already holds (the engine syncs it after every edit).
     pub fn drop_edit_modes(&mut self) {
@@ -828,6 +1129,14 @@ fn default_graphic_styles() -> Vec<GraphicStyle> {
     .collect()
 }
 
+impl Document {
+    /// Make the next id allocated at least `next`: ids handed out outside the layer tree (such
+    /// as an importer's opacity mask and pattern art), which [`Document::fix_next_id`] doesn't see.
+    pub fn reserve_ids(&mut self, next: u64) {
+        self.next_id = self.next_id.max(next);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,6 +1158,23 @@ mod tests {
         assert_eq!(d.layers.len(), 1);
         assert_eq!(d.layers[0].display_name(), "Layer 1");
         assert_eq!(d.artboards[0].rect, Rect::new(0.0, 0.0, 612.0, 792.0));
+    }
+
+    #[test]
+    fn art_on_artboard_takes_unlocked_objects_wholly_inside() {
+        let (mut d, a, b) = doc_with_rects();
+        let wide = Rect::new(-1.0, -1.0, 40.0, 15.0);
+        assert_eq!(d.art_on_artboard(Rect::new(-1.0, -1.0, 15.0, 15.0), false), vec![a]);
+        assert_eq!(d.art_on_artboard(Rect::new(-1.0, -1.0, 25.0, 15.0), false), vec![a], "b only half inside");
+        d.node_mut(a).unwrap().locked = true;
+        assert_eq!(d.art_on_artboard(wide, false), vec![b]);
+        // Move Locked and Hidden Artwork with Artboard (#394): hidden art stays too, unless on.
+        d.node_mut(b).unwrap().visible = false;
+        assert!(d.art_on_artboard(wide, false).is_empty());
+        assert_eq!(d.art_on_artboard(wide, true), vec![a, b]);
+        Arc::make_mut(&mut d.layers[0]).locked = true;
+        assert!(d.art_on_artboard(wide, false).is_empty());
+        assert_eq!(d.art_on_artboard(wide, true), vec![a, b], "a locked layer's art too");
     }
 
     #[test]
@@ -920,6 +1246,43 @@ mod tests {
     }
 
     #[test]
+    fn setup_round_trips_and_old_files_load() {
+        let (mut d, _, _) = doc_with_rects();
+        // A document without a setup writes no `setup` key (old readers and files stay unchanged).
+        assert!(!serde_json::to_string(&d).unwrap().contains("\"setup\""));
+        d.setup.bleed = [9.0, 9.0, 0.0, 18.0];
+        d.setup.grid_size = GridSize::Large;
+        d.setup.typographers_quotes = false;
+        d.setup.quotes = setup::language_quotes("German").unwrap();
+        d.setup.flattener_preset = Some("High Resolution".into());
+        d.setup.background = Background::White;
+        d.setup.export_text = ExportText::Appearance;
+        let back: Document = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back.setup, d.setup);
+        // Files written before Document Setup existed load with the defaults.
+        let mut v = serde_json::to_value(&d).unwrap();
+        v.as_object_mut().unwrap().remove("setup");
+        let old: Document = serde_json::from_value(v).unwrap();
+        assert_eq!(old.setup, DocSetup::default());
+    }
+
+    #[test]
+    fn char_position_round_trips() {
+        let st = CharStyle {
+            position: CharPosition::Subscript(ScriptMetrics { size: 50.0, position: 20.0 }),
+            small_caps: Some(75.0),
+            ..CharStyle::default()
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        assert_eq!(v["position"], serde_json::json!({"kind": "subscript", "size": 50.0, "position": 20.0}));
+        assert_eq!(serde_json::from_value::<CharStyle>(v).unwrap(), st);
+        let plain = serde_json::to_value(CharStyle::default()).unwrap();
+        assert!(plain.get("position").is_none() && plain.get("small_caps").is_none());
+        let (scale, shift) = CharPosition::Subscript(ScriptMetrics::DEFAULT).scale_shift(10.0);
+        assert!((scale - 0.583).abs() < 1e-9 && (shift + 3.33).abs() < 1e-9);
+    }
+
+    #[test]
     fn units() {
         assert_eq!(Unit::Inches.parse("1"), Some(72.0));
         assert_eq!(Unit::Points.parse("1in"), Some(72.0));
@@ -934,5 +1297,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod tests_slices;
 #[cfg(test)]
 mod tests_units;

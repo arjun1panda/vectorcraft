@@ -82,6 +82,11 @@ pub const UNITS: &[(&str, &str)] = &[
     ("feet", "Feet"),
 ];
 const LINE_STYLE: &[(&str, &str)] = &[("lines", "Lines"), ("dots", "Dots")];
+/// Performance › Graphics Processor (`gpuPreference`), read by the desktop app at startup. The
+/// values are WebGPU's power preferences plus `automatic`; 0.5.0's default, `powerSaving`, reads as
+/// `automatic` (#502).
+pub const GPU_PREFERENCES: &[(&str, &str)] =
+    &[("automatic", "Automatic"), ("lowPower", "Power Saving (integrated)"), ("highPerformance", "High Performance (discrete)")];
 const BLACK: &[(&str, &str)] = &[("accurate", "Display All Blacks Accurately"), ("rich", "Display All Blacks as Rich Black")];
 const BLACK_OUT: &[(&str, &str)] = &[("accurate", "Output All Blacks Accurately"), ("rich", "Output All Blacks as Rich Black")];
 
@@ -128,6 +133,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("scaleCorners", "General", "Options", "Scale Corners", bool),
     p!("scaleStrokes", "General", "Options", "Scale Strokes & Effects", bool),
     p!("zoomWithMouseWheel", "General", "Options", "Zoom with Mouse Wheel", bool),
+    p!("scrubNumericFields", "General", "Options", "Scrub Numeric Fields by Dragging", bool),
     // Selection & Anchor Display
     p!("selectionTolerance", "Selection & Anchor Display", "Selection", "Tolerance", num(1.0, 8.0, "px")),
     p!("objectSelectionByPathOnly", "Selection & Anchor Display", "Selection", "Object Selection by Path Only", bool),
@@ -181,6 +187,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("missingGlyphProtection", "Type", "Options", "Enable Missing Glyph Protection", bool),
     p!("highlightAlternateGlyphs", "Type", "Options", "Highlight Alternate Glyphs", bool),
     p!("placeholderText", "Type", "Options", "Fill New Type Objects With Placeholder Text", bool),
+    p!("fontsFolder", "Type", "Options", "Additional Fonts Folder", text),
     // Units
     p!("unitsGeneral", "Units", "", "General", choice(UNITS)),
     p!("unitsStroke", "Units", "", "Stroke", choice(UNITS)),
@@ -254,15 +261,31 @@ pub const PREF_SPECS: &[PrefSpec] = &[
         "Brightness",
         choice(&[("dark", "Dark"), ("mediumDark", "Medium Dark"), ("mediumLight", "Medium Light"), ("light", "Light")])
     ),
-    p!("canvasColor", "User Interface", "", "Canvas Color", choice(&[("matchUi", "Match User Interface Brightness"), ("white", "White")])),
+    p!(
+        "canvasColor",
+        "User Interface",
+        "",
+        "Canvas Color",
+        choice(&[
+            ("matchUi", "Match User Interface Brightness"),
+            ("white", "White"),
+            ("lightGray", "Light Gray"),
+            ("mediumGray", "Medium Gray"),
+            ("darkGray", "Dark Gray")
+        ])
+    ),
     p!("autoCollapseIconPanels", "User Interface", "", "Auto-Collapse Iconic Panels", bool),
+    p!("toolGroupLabels", "User Interface", "", "Show Tool Group Labels", bool),
     p!("openDocumentsAsTabs", "User Interface", "", "Open Documents As Tabs", bool),
     p!("largeTabs", "User Interface", "", "Large Tabs", bool),
     p!("uiScaling", "User Interface", "UI Scaling", "Scale", num(0.75, 2.0, "×")),
     p!("scaleCursorWithUi", "User Interface", "UI Scaling", "Scale Cursor Proportional to UI", bool),
+    // `auto` or a language code the shell registers (`zh-hant`); the shell shows it as a dropdown.
+    p!("interfaceLanguage", "User Interface", "Language", "Language", text),
     // Performance
     p!("gpuPerformance", "Performance", "GPU Performance", "GPU Performance", bool),
     p!("animatedZoom", "Performance", "GPU Performance", "Animated Zoom", bool),
+    p!("gpuPreference", "Performance", "GPU Performance", "Graphics Processor", choice(GPU_PREFERENCES)),
     p!("historyStates", "Performance", "", "History States", int(5, 1000)),
     p!("realTimeDrawing", "Performance", "", "Real-time Drawing and Editing", bool),
     p!("renderThreads", "Performance", "", "Render Threads (-1 = Automatic)", int(-1, 64)),
@@ -315,6 +338,13 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("japaneseCropMarks", "General", "Options", "Use Japanese Crop Marks", bool),
     // Appearance panel menu
     p!("newArtBasic", "General", "Appearance Panel", "New Art Has Basic Appearance", bool),
+    // File Handling (continued)
+    p!("templatesFolder", "File Handling", "Files", "Templates Folder", text),
+    p!("appendConverted", "File Handling", "Files", "Mark Older Files as [Converted] When Opened", bool),
+    // Native saves (`document.save {compress}`)
+    p!("useCompression", "File Handling", "Files", "Use Compression", bool),
+    // The W/H link of the Transform panel, the Properties panel and the Control bar
+    p!("constrainProportions", "General", "Transform Panel", "Constrain Width and Height Proportions", bool),
 ];
 
 pub fn spec(key: &str) -> Option<&'static PrefSpec> {
@@ -322,10 +352,11 @@ pub fn spec(key: &str) -> Option<&'static PrefSpec> {
 }
 
 /// Preferences kept as one object with a command of their own instead of [`PREF_SPECS`] rows (they
-/// aren't in the Preferences dialog): the Eyedropper Options (`eyedropper.setOptions`). `prefs.get`
+/// aren't in the Preferences dialog): the Eyedropper Options (`eyedropper.setOptions`) and the
+/// Perspective Grid Options (`perspective.widget.options`). `prefs.get`
 /// and `prefs.set` take them by key (a partial object updates what it names) and `prefs.reset`
 /// without a category resets them.
-pub const PREF_GROUPS: &[&str] = &["eyedropper"];
+pub const PREF_GROUPS: &[&str] = &["eyedropper", "perspectiveWidget"];
 
 /// Validate a value for preference group `key` against `current`.
 fn validate_group(key: &str, current: &Value, v: &Value) -> std::result::Result<Value, String> {
@@ -333,6 +364,15 @@ fn validate_group(key: &str, current: &Value, v: &Value) -> std::result::Result<
         "eyedropper" => {
             let cur: super::EyedropperOptions = serde_json::from_value(current.clone()).unwrap_or_default();
             cur.merged(v).map(|o| json!(o))
+        }
+        "perspectiveWidget" => {
+            let mut merged = current.clone();
+            if let (Some(o), Some(p)) = (merged.as_object_mut(), v.as_object()) {
+                o.extend(p.clone());
+            }
+            serde_json::from_value::<vectorcraft_tools::distort::perspective::widget::WidgetOptions>(merged)
+                .map(|o| json!(o))
+                .map_err(|e| e.to_string())
         }
         _ => Err(format!("unknown preference `{key}`")),
     }
@@ -372,6 +412,11 @@ pub fn validate(key: &str, v: &Value) -> std::result::Result<Value, String> {
             } else {
                 Err(format!("`{key}` must be a #rrggbb colour"))
             }
+        }
+        PrefKind::Text if key == "interfaceLanguage" => {
+            let s = v.as_str().map(str::trim).unwrap_or("");
+            let ok = !s.is_empty() && s.len() <= 16 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            if ok { Ok(json!(s.to_ascii_lowercase())) } else { Err(format!("`{key}` must be `auto` or a language code such as `en` or `zh-hant`")) }
         }
         PrefKind::Text => match v {
             Value::String(s) => Ok(json!(s)),
@@ -429,7 +474,18 @@ impl Session {
         let grid_changed = p.gridline_every != self.prefs.gridline_every || p.grid_subdivisions != self.prefs.grid_subdivisions;
         let history_changed = p.history_states != self.prefs.history_states;
         let tile_edge_changed = p.pattern_tile_edge_color != self.prefs.pattern_tile_edge_color;
+        let fonts_folder_changed = p.fonts_folder != self.prefs.fonts_folder;
         self.prefs = p;
+        if fonts_folder_changed {
+            let folder = self.prefs.fonts_folder.trim();
+            vectorcraft_text::set_user_font_dirs(if folder.is_empty() { vec![] } else { vec![folder.into()] });
+            // Once the fonts were scanned, scan again now: the folder's fonts appear (or go) in the
+            // font menus, and type in them lays out again. The first scan reads it anyway.
+            if vectorcraft_text::FontDb::global().installed_fonts_changed() {
+                // Its result only counts the faces cataloged.
+                let _ = super::fonts::rescan(self, &serde_json::Value::Null);
+            }
+        }
         vectorcraft_render::set_default_threads(u16::try_from(self.prefs.render_threads).ok());
         for st in &mut self.docs {
             if history_changed {
@@ -448,6 +504,8 @@ impl Session {
                 st.revision += 1;
             }
         }
+        // Plug-ins in a newly set Additional Plug-ins Folder are installed.
+        super::plugin::sync_prefs(self);
     }
 }
 

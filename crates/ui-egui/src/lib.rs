@@ -5,56 +5,175 @@
 //! shortcuts, the ⌘K palette and the control channel ([`control`]).
 #![forbid(unsafe_code)]
 
+/// Translate a UI string literal into the language the UI is drawn in (see [`i18n`]).
+#[macro_export]
+macro_rules! tl {
+    ($s:expr) => {
+        $crate::i18n::t($s)
+    };
+}
+
+pub mod background;
 mod brand;
 pub mod canvas;
 pub mod chrome;
+mod clipboard_probe;
 pub mod community;
 pub mod control;
+pub mod credits;
 pub mod cursors;
 pub mod dialogs;
 pub mod dock;
 pub mod find_font;
+pub mod floating;
+pub mod font_menu;
+mod free_transform;
+pub mod graphics;
+pub mod i18n;
 pub mod icon_data;
 pub mod icons;
 pub mod io;
 pub mod menus;
+pub mod native_menu;
 pub mod palette;
 pub mod panels;
+pub mod picks;
+pub mod place;
 pub mod prefs_dialog;
+pub mod print;
+pub mod recovery;
 pub mod render_worker;
+mod scrub;
 pub mod shortcut_editor;
 pub mod shortcuts;
 pub mod state;
+pub mod sysclip;
 pub mod theme;
 pub mod titlebar;
 pub mod toolbar;
+mod touch;
+mod ui_fonts;
 pub mod unsaved;
 pub mod widgets;
 pub mod workspaces;
 
 #[cfg(test)]
+mod tests_adjust;
+#[cfg(test)]
+mod tests_aisave;
+#[cfg(test)]
+mod tests_background;
+#[cfg(test)]
+mod tests_clipboard;
+#[cfg(test)]
+mod tests_contextmenu;
+#[cfg(test)]
+mod tests_cut;
+#[cfg(test)]
+mod tests_distortkeys;
+#[cfg(test)]
+mod tests_docsetup;
+#[cfg(test)]
+mod tests_font_menu;
+#[cfg(test)]
+mod tests_fonts;
+#[cfg(test)]
+mod tests_home;
+#[cfg(test)]
 mod tests_labels;
+#[cfg(test)]
+mod tests_nativemenu;
+#[cfg(test)]
+mod tests_nativeoptions;
+#[cfg(test)]
+mod tests_numfields;
 #[cfg(test)]
 mod tests_overprint;
 #[cfg(test)]
 mod tests_paintchips;
 #[cfg(test)]
+mod tests_pastechords;
+#[cfg(test)]
+mod tests_pathtype;
+#[cfg(test)]
+mod tests_pdfoutput;
+#[cfg(test)]
+mod tests_picks;
+#[cfg(test)]
+mod tests_place;
+#[cfg(test)]
+mod tests_plugins;
+#[cfg(test)]
+mod tests_printps;
+#[cfg(test)]
+mod tests_printtiling;
+#[cfg(test)]
+mod tests_puppetwarp;
+#[cfg(test)]
 mod tests_recolor;
+#[cfg(test)]
+mod tests_recovery;
+#[cfg(test)]
+mod tests_removeanchors;
+#[cfg(test)]
+mod tests_save;
+#[cfg(test)]
+mod tests_saveext;
+#[cfg(test)]
+mod tests_screenmode;
+#[cfg(test)]
+mod tests_scrub;
+#[cfg(test)]
+mod tests_selectall;
+#[cfg(test)]
+mod tests_slices;
 #[cfg(test)]
 mod tests_svg;
 #[cfg(test)]
+mod tests_svgsave;
+#[cfg(test)]
+mod tests_synthetic;
+#[cfg(test)]
+mod tests_sysclip;
+#[cfg(test)]
+mod tests_sysclip_emf;
+#[cfg(test)]
+mod tests_sysclip_probe;
+#[cfg(test)]
 mod tests_transparencygrid;
+#[cfg(test)]
+mod tests_widthtool;
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
+use vectorcraft_engine::cmd::fileio;
 use vectorcraft_engine::{Session, ViewInfo};
 
 pub use control::{ControlRequest, ControlResponse};
 pub use state::{UiState, View};
+pub use sysclip::{ClipboardProbeFactory, SystemClipboard};
 
-pub type PickSave = Box<dyn FnMut(&str) -> Option<String>>;
+/// What a file dialog shows: a suggested file name (save dialogs), the folder to start in and the
+/// file-type filters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FilePick {
+    pub name: String,
+    pub folder: Option<String>,
+    /// `(label, extensions without the dot)`, the default type first; empty = every file.
+    pub filters: Vec<(&'static str, &'static [&'static str])>,
+}
+
+impl FilePick {
+    /// A save dialog suggesting `name`.
+    pub fn named(name: &str) -> Self {
+        Self { name: name.to_string(), ..Default::default() }
+    }
+}
+
+pub type PickOpen = Box<dyn FnMut(&FilePick) -> Option<String>>;
+pub type PickSave = Box<dyn FnMut(&FilePick) -> Option<String>>;
 pub type ReadFn = Box<dyn Fn(&str) -> Result<Vec<u8>, String>>;
 pub type WriteFn = Box<dyn FnMut(&str, &[u8]) -> Result<(), String>>;
 pub type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
@@ -63,12 +182,15 @@ pub type DownloadFn = Box<dyn FnMut(&str, &[u8])>;
 /// Opens a URL in the system browser.
 pub type OpenUrlFn = Box<dyn FnMut(&str)>;
 
+/// Shows a file in the system file manager, or opens it in its app.
+pub type RevealFn = Box<dyn FnMut(&str) -> Result<(), String>>;
+
 /// Platform services injected by the host app (desktop or web).
 #[derive(Default)]
 pub struct Services {
     /// Show an open dialog; returns a path.
-    pub pick_open: Option<Box<dyn FnMut() -> Option<String>>>,
-    /// Show a save dialog with a suggested file name; returns a path.
+    pub pick_open: Option<PickOpen>,
+    /// Show a save dialog (suggested name, folder, file types); returns a path.
     pub pick_save: Option<PickSave>,
     pub read: Option<ReadFn>,
     pub write: Option<WriteFn>,
@@ -83,6 +205,43 @@ pub struct Services {
     pub clipboard_read: Option<Box<dyn FnMut() -> Option<String>>>,
     /// Open a URL in the system browser (desktop). Without it, egui opens it (a new tab on the web).
     pub open_url: Option<OpenUrlFn>,
+    /// Show an open dialog for several files (File → Place…); returns their paths (none: cancelled).
+    pub pick_open_multi: Option<Box<dyn FnMut() -> Vec<String>>>,
+    /// Web: start an async pick of files to place (they arrive via `place_inbox`).
+    pub place_async: Option<Box<dyn FnMut()>>,
+    /// Files that arrived asynchronously to be placed (web: picked for Place, or dropped on the
+    /// canvas).
+    pub place_inbox: Option<place::PlaceInbox>,
+    /// The system clipboard with all its formats (desktop): Copy offers text, SVG, PDF and PNG,
+    /// Paste takes SVG, PDF, text and bitmaps from other apps. Without it, SVG text only (through
+    /// egui and `clipboard_read`).
+    pub system_clipboard: Option<Box<dyn SystemClipboard>>,
+    /// A second system-clipboard handle, for checking whether Paste has something to take on a
+    /// background thread (Linux: an X11 clipboard owner that never answers would freeze the UI).
+    /// Taken on the first frame. Without it the check runs on the UI thread.
+    pub clipboard_probe: Option<ClipboardProbeFactory>,
+    /// File → Show in Folder: select a file in the system file manager (desktop).
+    pub reveal: Option<RevealFn>,
+    /// Write a file from any thread (desktop): lets Background Save and Export write off the UI
+    /// thread ([`background`]). Without it they run at once.
+    pub write_shared: Option<background::SharedWriteFn>,
+    /// Open a file (or a folder) in the system's default app for it (desktop: Edit Original, Show
+    /// Package). Without it (the web) those answer with an error.
+    pub open_file: Option<RevealFn>,
+    /// Show a folder picker; returns its path (desktop: Relink to Folder, Package).
+    pub pick_folder: Option<Box<dyn FnMut() -> Option<String>>>,
+    /// Where Data Recovery keeps its copies when not in a folder (the web's browser storage;
+    /// tests): installed into the session ([`vectorcraft_engine::cmd::recovery`]).
+    pub recovery_store: Option<std::sync::Arc<dyn vectorcraft_engine::cmd::recovery::RecoveryStore>>,
+    /// File → Print: the system's printers and print queue (desktop), the browser's print dialog
+    /// (web). Without it Print saves the job as a PDF.
+    pub print: Option<Box<dyn print::PrintService>>,
+    /// The macOS menu bar, when the desktop app installed one: the in-window menus are hidden then.
+    pub native_menu: Option<native_menu::NativeMenu>,
+    /// Show file dialogs off the UI thread (desktop Linux, where a dialog in line holds the window
+    /// and the compositor finds it not answering): what asked runs again with the answer
+    /// ([`picks`]). Without it they are shown in line.
+    pub start_pick: Option<picks::StartPick>,
 }
 
 /// Cached canvas raster.
@@ -93,7 +252,23 @@ pub struct CanvasCache {
     pub last_ms: f64,
     pub worker: Option<render_worker::Worker>,
     pub worker_started: bool,
+    /// The slices as laid out for (document uid, revision): the canvas draws them every frame.
+    pub slices: Option<SliceCache>,
+    /// The print tiling's pages for (document uid, revision) (View → Show Print Tiling).
+    pub print_tiling: Option<PrintTilingCache>,
+    /// [`VectorcraftApp::selection_box`] for (document uid, revision, Use Preview Bounds).
+    pub selection_box: Option<((u64, u64, bool), Option<vectorcraft_doc::OrientedBox>)>,
+    /// [`VectorcraftApp::selection_bounds`] for (document uid, revision).
+    pub selection_bounds: Option<((u64, u64), Option<vectorcraft_geom::Rect>)>,
+    /// The tools' cursors as OS cursor bitmaps.
+    pub cursors: cursors::Images,
 }
+
+/// [`CanvasCache::slices`]: the layout of the slices of (document uid, revision).
+pub type SliceCache = ((u64, u64), std::sync::Arc<Vec<vectorcraft_doc::SliceArea>>);
+
+/// [`CanvasCache::print_tiling`]: the print tiling of (document uid, revision).
+pub type PrintTilingCache = ((u64, u64), std::sync::Arc<Vec<vectorcraft_pdf::TilingPage>>);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CacheKey {
@@ -109,6 +284,15 @@ pub struct CacheKey {
     pub ppp: f32,
     pub hidden: Vec<u64>,
     pub rot: f64,
+    /// General › Anti-aliased Artwork.
+    pub anti_alias: bool,
+    /// [`vectorcraft_render::placed_document::generation`]: placed documents' bitmaps made since.
+    pub placed: u64,
+    /// View › Pixel Preview: the document pixels rendered (x0, y0, x1, y1), one per point, shown
+    /// with hard edges. None: the art is rendered for the screen.
+    pub pixel: Option<[i64; 4]>,
+    /// Images sampled smoothly ([`vectorcraft_render::RenderOptions::smooth_images`]).
+    pub smooth_images: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -127,12 +311,11 @@ pub struct VectorcraftApp {
     pub perf: Perf,
     /// macOS: draw our own title strip under the traffic lights.
     pub integrated_titlebar: bool,
-    /// The host installed a native menu bar (macOS): don't draw in-window menus.
-    pub native_menu: bool,
     /// Last applied effect (Effect → Apply Last Effect).
     pub last_effect: Option<(String, serde_json::Value)>,
-    /// Commands whose shortcuts the native menu handles (skip them in egui to avoid double firing).
-    pub native_shortcuts: std::collections::HashSet<String>,
+    /// Commands run through [`Self::run`] so far: the native menu bar reads its rows again when it
+    /// moves ([`native_menu::sync`]).
+    run_count: u64,
     control_rx: Option<Receiver<ControlRequest>>,
     /// (token, path, reply, deadline ms): a window that isn't presented never delivers its frame.
     pending_screenshots: Vec<(u64, Option<String>, Sender<ControlResponse>, f64)>,
@@ -142,6 +325,11 @@ pub struct VectorcraftApp {
     pub synthetic: Vec<egui::Event>,
     styled: bool,
     fonts_ready: bool,
+    /// The egui context the UI's textures were uploaded to (0: none yet; see
+    /// [`Self::adopt_context`]).
+    context: u64,
+    /// Installed fonts added to the UI's for characters its own fonts lack (CJK names…).
+    ui_fonts: ui_fonts::UiFonts,
     frame: u64,
     last_time: f64,
     /// Canvas rect of the last frame (screen points), for control-channel coordinate mapping.
@@ -149,20 +337,66 @@ pub struct VectorcraftApp {
     /// Hover position in document coordinates.
     pub hover_doc: Option<vectorcraft_geom::Point>,
     /// System clipboard: SVG to publish next frame, the last SVG we published (so pasting it back
-    /// uses the lossless internal clipboard) and text that arrived with a Paste event.
+    /// uses the lossless internal clipboard) and what came with a paste (a Paste event's text, a
+    /// picture or file the host read: [`Self::paste_from_host`]).
     clipboard_out: Option<String>,
     clipboard_published: Option<String>,
-    pub(crate) clipboard_in: Option<String>,
+    pub(crate) clipboard_in: Option<vectorcraft_engine::cmd::clipboard::Flavour>,
     /// A URL to open through egui next frame (when the host has no `open_url` service).
     pending_url: Option<String>,
     /// Windows and Linux: the window has no OS decorations, so the app bar is the title bar (drag,
     /// double-click to maximize, caption buttons) and invisible edge zones resize the window.
     pub custom_titlebar: bool,
+    /// The graphics adapter the window renders with ("name (backend)"), as the host reports it:
+    /// shown in Help › About and `ui.inspect` for GPU bug reports. `None` when unknown.
+    pub graphics_adapter: Option<String>,
+    /// File → Place: picked files, the place cursor's thumbnails, the Control bar's image details.
+    pub place: place::PlaceState,
+    /// The Paste commands can paste from the system clipboard alone: it holds something to paste
+    /// (SVG without a `system_clipboard`) while the internal clipboard is empty. It enables the
+    /// Paste menu items.
+    pub(crate) system_paste: bool,
+    /// When `system_paste` was last checked in line (app time, s; at most once per frame).
+    system_paste_at: f64,
+    /// The thread that checks the system clipboard for `system_paste` instead
+    /// ([`Services::clipboard_probe`]).
+    clipboard_probe: Option<clipboard_probe::Probe>,
+    /// File dialogs shown off the UI thread and what runs again with their answers.
+    pub(crate) picks: picks::Picks,
+    /// The look for fonts installed or removed while the app was in the background, running
+    /// ([`Self::refresh_installed_fonts`]): whether they were.
+    font_check: Option<std::sync::mpsc::Receiver<bool>>,
+    /// Keyboard pastes of something other than text (see [`shortcuts::PasteChord`]).
+    pub(crate) paste_chord: shortcuts::PasteChord,
+    /// Saves and exports running in the background (Preferences → File Handling).
+    pub background: background::Background,
+    /// Data Recovery's timer and startup question ([`recovery`]).
+    pub recovery: recovery::Timer,
+    /// Modifiers the keyboard holds (from the host's input), given back after synthetic input.
+    host_modifiers: egui::Modifiers,
+    /// Synthetic input set the modifiers egui holds (see [`Self::raw_input_hook`]).
+    synthetic_modifiers: bool,
+    /// The marked text the system IME last sent (`None` once it commits or clears). When the Type
+    /// tool stops composing on its own (a click, a tool switch), the IME is told to drop it.
+    pub(crate) ime_marked: Option<String>,
+    /// The IME must drop its marked text (see [`Self::take_ime_discard`]).
+    pub(crate) ime_discard: bool,
+    /// A numeric field is being scrubbed: the document's edits meanwhile are one undo step
+    /// ([`scrub::begin_frame`]).
+    scrub_group: bool,
 }
 
+/// Seconds between two looks at the system clipboard for [`VectorcraftApp::system_paste`].
+const SYSTEM_CLIPBOARD_POLL: f64 = 0.25;
+
 impl VectorcraftApp {
-    pub fn new(session: Session, services: Services) -> Self {
-        let views = session.documents().iter().map(|_| View::default()).collect();
+    pub fn new(mut session: Session, services: Services) -> Self {
+        // The font menus and the first file opened need the installed fonts: catalog them now.
+        vectorcraft_text::FontDb::global().scan_in_background();
+        if let Some(store) = &services.recovery_store {
+            session.recovery.set_store(store.clone());
+        }
+        let views = session.documents().iter().map(View::of).collect();
         Self {
             session,
             ui: UiState::default(),
@@ -175,12 +409,16 @@ impl VectorcraftApp {
                 last_ms: 0.0,
                 worker: None,
                 worker_started: false,
+                slices: None,
+                print_tiling: None,
+                selection_box: None,
+                selection_bounds: None,
+                cursors: Default::default(),
             },
             perf: Perf::default(),
             integrated_titlebar: false,
-            native_menu: false,
             last_effect: None,
-            native_shortcuts: Default::default(),
+            run_count: 0,
             clipboard_out: None,
             clipboard_published: None,
             clipboard_in: None,
@@ -192,11 +430,28 @@ impl VectorcraftApp {
             synthetic: vec![],
             styled: false,
             fonts_ready: false,
+            context: 0,
+            ui_fonts: Default::default(),
             frame: 0,
             last_time: 0.0,
             canvas_rect: None,
             hover_doc: None,
             custom_titlebar: false,
+            graphics_adapter: None,
+            place: Default::default(),
+            system_paste: false,
+            system_paste_at: f64::NEG_INFINITY,
+            clipboard_probe: None,
+            picks: picks::Picks::default(),
+            font_check: None,
+            paste_chord: Default::default(),
+            background: Default::default(),
+            recovery: Default::default(),
+            host_modifiers: Default::default(),
+            synthetic_modifiers: false,
+            ime_marked: None,
+            ime_discard: false,
+            scrub_group: false,
         }
     }
 
@@ -205,13 +460,11 @@ impl VectorcraftApp {
         self
     }
 
-    /// Keep `views` aligned with the session's documents.
+    /// Keep `views` aligned with the session's documents (a new one starts at its saved view).
     pub fn sync_views(&mut self) {
-        let n = self.session.documents().len();
-        while self.views.len() < n {
-            self.views.push(View::default());
-        }
-        self.views.truncate(n);
+        let docs = self.session.documents();
+        self.views.truncate(docs.len());
+        self.views.extend(docs.iter().skip(self.views.len()).map(View::of));
     }
 
     pub fn view(&self) -> Option<&View> {
@@ -228,33 +481,89 @@ impl VectorcraftApp {
             zoom: self.view().map(|v| v.zoom).unwrap_or(1.0),
             outline: self.ui.view.outline,
             smart_guides: self.ui.view.smart_guides,
+            guides: self.ui.view.guides,
             snap_to_grid: self.ui.view.snap_to_grid,
             snap_to_pixel: self.ui.view.snap_to_pixel,
             show_bbox: self.ui.view.bounding_box,
             snap_to_point: self.ui.view.snap_to_point,
             corner_widgets: self.ui.view.corner_widgets,
+            screen: self.screen_frame(),
         }
+    }
+
+    /// The canvas on screen in document coordinates (none before it is laid out).
+    pub fn screen_frame(&self) -> Option<vectorcraft_tools::ScreenFrame> {
+        let (rect, view) = (self.canvas_rect?, self.view()?);
+        let xf = canvas::Xf::new(rect, view);
+        let px = |x: f32, y: f32| xf.delta_to_doc(egui::vec2(x, y));
+        Some(vectorcraft_tools::ScreenFrame {
+            origin: xf.to_doc(rect.left_top()),
+            right: px(1.0, 0.0),
+            down: px(0.0, 1.0),
+            size: (f64::from(rect.width()), f64::from(rect.height())),
+        })
     }
 
     /// Run a UI or engine command by id. The single entry point for every frontend path.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        // A file dialog it shows off the UI thread runs it again with the path picked.
+        if self.picks.is_entry_free() {
+            let entry = picks::Entry::Command(id.to_string(), params.clone());
+            return picks::as_entry(self, move || entry, |app| app.run_now(id, params));
+        }
+        self.run_now(id, params)
+    }
+
+    /// [`Self::run`] it, inside what asks for file dialogs.
+    fn run_now(&mut self, id: &str, params: Value) -> Result<Value, String> {
+        self.run_count = self.run_count.wrapping_add(1);
         if let Some(r) = menus::run_ui_command(self, id, &params) {
             return r;
         }
+        let mut params = params;
         if id.starts_with("edit.paste") {
-            self.adopt_system_clipboard();
+            if let Err(e) = self.adopt_system_clipboard() {
+                self.ui.status = e.clone();
+                return Err(e);
+            }
+            // Paste (also without formatting) goes to the centre of the view.
+            if matches!(id, "edit.paste" | "edit.pasteWithoutFormatting")
+                && ["center", "dx", "dy"].iter().all(|k| params.get(k).is_none())
+                && let Some(c) = self.view().filter(|v| v.fitted).map(|v| v.center)
+                && let Some(p) = params.as_object_mut()
+            {
+                p.insert("center".into(), serde_json::json!([c.x, c.y]));
+            }
+            // In place, in front, in back: onto the active artboard (#693).
+            if matches!(id, "edit.pasteInPlace" | "edit.pasteInFront" | "edit.pasteInBack")
+                && params.get("artboard").is_none()
+                && let Some(i) = self.view().map(|v| v.artboard)
+                && let Some(p) = params.as_object_mut()
+            {
+                p.insert("artboard".into(), serde_json::json!(i));
+            }
+            if let Some(r) = dialogs::swatch_conflict::ask(self, id, &params) {
+                return r;
+            }
+        }
+        // Native files carry the view they reopen at.
+        if fileio::SaveMode::of(id).is_some() {
+            io::remember_view(self);
         }
         let r = self.session.execute(id, &params).map_err(|e| e.to_string());
-        if r.is_ok() && matches!(id, "edit.copy" | "edit.cut") && self.session.prefs.copy_as_svg {
-            self.clipboard_out = self.session.clipboard_svg();
-            self.clipboard_published = self.clipboard_out.clone();
+        if r.is_ok() && matches!(id, "edit.copy" | "edit.cut") {
+            self.publish_clipboard();
         }
         self.sync_views();
         match &r {
             Err(e) => self.ui.status = e.clone(),
-            Ok(_) => {
+            Ok(v) => {
                 if id == "file.new" {
                     self.ui.status.clear();
+                    // New Document's Pixel preview mode (Overprint Preview is the engine's).
+                    if v["previewMode"] == "pixel" {
+                        self.ui.view.pixel_preview = true;
+                    }
                 }
                 if id == "text.setStyle"
                     && let Some(font) = params.get("font").and_then(Value::as_str)
@@ -262,26 +571,11 @@ impl VectorcraftApp {
                     let r = &mut self.ui.recent_fonts;
                     r.retain(|f| f != font);
                     r.insert(0, font.to_string());
-                    r.truncate(10);
+                    r.truncate(MAX_RECENT_FONTS);
                 }
             }
         }
         r
-    }
-
-    /// Before a paste: SVG that another app put on the system clipboard replaces the internal
-    /// clipboard (centred in the view). Our own published SVG keeps the lossless internal copy.
-    fn adopt_system_clipboard(&mut self) {
-        let text = self.clipboard_in.take().or_else(|| self.services.clipboard_read.as_mut().and_then(|f| f()));
-        let Some(text) = text.filter(|t| vectorcraft_engine::cmd::clipboard::looks_like_svg(t)) else { return };
-        if self.clipboard_published.as_deref() == Some(text.as_str()) {
-            return;
-        }
-        let center = self.view().map(|v| [v.center.x, v.center.y]);
-        match self.session.execute("clipboard.importSvg", &serde_json::json!({ "svg": text, "center": center })) {
-            Ok(_) => self.clipboard_published = Some(text),
-            Err(e) => self.ui.status = format!("Couldn't paste SVG: {e}"),
-        }
     }
 
     /// Open a link in the browser (Help → Discord, website, GitHub…).
@@ -393,6 +687,13 @@ impl VectorcraftApp {
         });
     }
 
+    /// Did the Type tool end an IME composition on its own this frame? Interrupting the IME
+    /// through egui (`should_interrupt_composition`) doesn't reach the macOS input context, which
+    /// keeps the marked text and types it again into the next composition: the host discards it.
+    pub fn take_ime_discard(&mut self) -> bool {
+        std::mem::take(&mut self.ime_discard)
+    }
+
     /// Show a transient status message.
     pub fn status(&mut self, s: impl Into<String>) {
         self.ui.status = s.into();
@@ -406,6 +707,7 @@ impl VectorcraftApp {
                 self.status(format!("Couldn't open {name}: {e}"));
             }
         }
+        place::drain(self);
     }
 }
 
@@ -421,9 +723,60 @@ pub fn now_ms() -> f64 {
     }
 }
 
+/// The most fonts Type › Recent Fonts lists (Preferences › Type › Number of Recent Fonts).
+pub const MAX_RECENT_FONTS: usize = 15;
+
+impl VectorcraftApp {
+    /// Type › Recent Fonts: the fonts used last, newest first, as many as Preferences › Type ›
+    /// Number of Recent Fonts says.
+    pub fn recent_fonts(&self) -> &[String] {
+        let n = usize::try_from(self.session.prefs.recent_fonts_count).unwrap_or(MAX_RECENT_FONTS).clamp(1, MAX_RECENT_FONTS);
+        self.ui.recent_fonts.get(..n).unwrap_or(&self.ui.recent_fonts)
+    }
+
+    /// The selection's bounding box, rotated with rotated objects ([`Session::transform_box`]). The
+    /// canvas and the transform fields read it every frame: it is measured once per revision.
+    pub fn selection_box(&mut self) -> Option<vectorcraft_doc::OrientedBox> {
+        let st = self.session.active()?;
+        let key = (st.uid, st.revision, self.session.prefs.use_preview_bounds);
+        if let Some((k, b)) = self.canvas.selection_box
+            && k == key
+        {
+            return b;
+        }
+        let b = self.session.transform_box(&st.selection.objects);
+        self.canvas.selection_box = Some((key, b));
+        b
+    }
+
+    /// The selection's visual bounds (stroke and effects included), square to the page: measured
+    /// once per revision, as the canvas reads it every frame (a traced photo selects a group of
+    /// hundreds of thousands of paths).
+    pub fn selection_bounds(&mut self) -> Option<vectorcraft_geom::Rect> {
+        let st = self.session.active()?;
+        let key = (st.uid, st.revision);
+        if let Some((k, b)) = self.canvas.selection_bounds
+            && k == key
+        {
+            return b;
+        }
+        let b = st.doc.bounds_of(&st.selection.objects, true);
+        self.canvas.selection_bounds = Some((key, b));
+        b
+    }
+}
+
 /// eframe isn't a dependency of this crate (the host owns the event loop); these entry points are
 /// called from the host's `eframe::App` impl.
 impl VectorcraftApp {
+    /// The language the UI is drawn in: the Preferences dialog's choice while it is open (so a
+    /// change shows before OK), else the `interfaceLanguage` preference (`auto` = the system's).
+    pub fn ui_language(&self) -> i18n::Lang {
+        let editing =
+            self.ui.dialog.as_ref().filter(|d| d.kind == "preferences").and_then(|d| d.fields.get("interfaceLanguage")).and_then(Value::as_str);
+        i18n::Lang::from_pref(editing.unwrap_or(&self.session.prefs.interface_language))
+    }
+
     /// Per-frame logic before layout (control channel, shortcuts, inbox). A bug that panics costs
     /// one frame and shows an error, instead of closing the app with unsaved work.
     pub fn logic(&mut self, ctx: &egui::Context) {
@@ -433,6 +786,13 @@ impl VectorcraftApp {
     }
 
     fn logic_frame(&mut self, ctx: &egui::Context) {
+        let lang = self.ui_language();
+        i18n::set_current(lang);
+        // The engine gives new type the Japanese defaults while the UI is in Japanese.
+        if self.session.ui_language.as_deref() != Some(lang.code()) {
+            self.session.ui_language = Some(lang.code().to_string());
+        }
+        self.adopt_context(ctx);
         if !self.styled {
             theme::install_fonts(ctx);
             theme::apply(ctx, self.ui.brightness);
@@ -449,12 +809,45 @@ impl VectorcraftApp {
         }
         self.last_time = now;
         self.sync_views();
-        // The window's close button (or the system quitting the app) asks about unsaved documents.
-        if ctx.input(|i| i.viewport().close_requested()) && unsaved::any_dirty(self) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            if let Err(e) = unsaved::close_all(self, "quit") {
-                self.status(e);
+        // Read the system clipboard only when that alone decides whether Paste is enabled. A
+        // background thread reads it where the host installs one (an unresponsive owner must never
+        // stall the frame loop); otherwise, or once that thread is gone, it is read here, at most a
+        // few times a second (opening it locks it against other apps on some systems).
+        let wanted = self.session.clipboard.is_empty() && self.session.active().is_some();
+        if let Some(make) = self.services.clipboard_probe.take() {
+            self.clipboard_probe = clipboard_probe::Probe::start(make, ctx.clone());
+        }
+        if let Some(pasteable) = self.clipboard_probe.as_mut().and_then(|p| p.pasteable(wanted)) {
+            self.system_paste = pasteable;
+        } else if !(0.0..SYSTEM_CLIPBOARD_POLL).contains(&(now - self.system_paste_at)) {
+            self.clipboard_probe = None;
+            self.system_paste_at = now;
+            self.system_paste = wanted && self.system_clipboard_pasteable();
+        }
+        self.poll_font_check(ctx);
+        picks::poll(self, ctx);
+        background::poll(self);
+        if !self.background.jobs.is_empty() {
+            // Keep the status bar's progress moving and pick the result up when it arrives.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // The window's close button (or the system quitting the app) asks about unsaved documents,
+        // once the saves running in the background are done.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            background::wait_all(self);
+            if unsaved::any_dirty(self) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if let Err(e) = unsaved::close_all(self, "quit") {
+                    self.status(e);
+                }
+            } else {
+                // Quitting with nothing unsaved: no copies to leave behind.
+                vectorcraft_engine::cmd::recovery::forget_all(&mut self.session);
             }
+        }
+        if let Some(wait) = recovery::frame(self, now) {
+            // The timer and heartbeat run in an idle window too.
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(wait));
         }
         shortcut_editor::sync(&self.ui);
         prefs_dialog::apply_runtime(self, ctx);
@@ -471,39 +864,131 @@ impl VectorcraftApp {
             ctx.copy_text(t);
         }
         self.drain_inbox();
+        native_menu::run(self, ctx);
         if self.fonts_ready {
             shortcuts::handle(self, ctx);
         }
-        // Native only: the web host reads dropped files asynchronously and feeds `Services::inbox`.
+        // Native only: the web host reads dropped files asynchronously and feeds the inboxes.
         #[cfg(not(target_arch = "wasm32"))]
-        for f in ctx.input(|i| i.raw.dropped_files.clone()) {
-            let path = f.path().to_path_buf();
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "dropped".into());
-            match f.bytes() {
-                Ok(b) => {
-                    let p = Some(path.to_string_lossy().to_string()).filter(|s| !s.is_empty());
-                    if let Err(e) = io::open_bytes(self, &name, &b, p) {
-                        self.status(format!("Couldn't open {name}: {e}"));
-                    }
-                }
+        self.take_dropped_files(ctx);
+    }
+
+    /// Files dropped on the window: documents opened, pictures and text placed on the canvas
+    /// ([`Self::drop_target`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let (dropped, shift) = ctx.input(|i| (i.raw.dropped_files.clone(), i.modifiers.shift));
+        if dropped.is_empty() {
+            return;
+        }
+        let pos = place::drag_pos(ctx);
+        let mut files = vec![];
+        for f in dropped {
+            let path = Some(f.path().to_string_lossy().to_string()).filter(|s| !s.is_empty());
+            let name = path.as_deref().map_or_else(|| "dropped".into(), vectorcraft_engine::cmd::fileio::file_name);
+            let target = self.drop_target(&name, pos, shift);
+            // A file placed by its path is read by the engine.
+            let bytes = if path.is_some() && target != place::DropTarget::Open { Ok(vec![]) } else { f.bytes() };
+            match bytes {
+                Ok(b) => files.push((target, (name, path, b))),
                 Err(e) => self.status(format!("Couldn't read {name}: {e}")),
             }
         }
+        place::drop_files(self, files);
     }
 
-    /// Inject synthetic events (one press/release step per frame).
-    pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
-        if self.synthetic.is_empty() {
+    /// Fonts installed or removed while the app was in the background are listed when it comes
+    /// back (Refresh Font List by itself): a look at the font folders, a scan only when they changed.
+    /// The look runs on another thread (asking DirectWrite for the fonts font services loaded
+    /// meanwhile takes tens of milliseconds on Windows, #579), [`Self::poll_font_check`] scans.
+    fn refresh_installed_fonts(&mut self) {
+        if self.font_check.is_some() {
             return;
         }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let look = move || {
+            // The UI gone meanwhile has nothing to refresh.
+            let _ = tx.send(vectorcraft_text::FontDb::global().installed_fonts_changed());
+        };
+        let spawned =
+            if cfg!(target_arch = "wasm32") { None } else { std::thread::Builder::new().name("font-check".into()).spawn(look.clone()).ok() };
+        if spawned.is_none() {
+            look();
+        }
+        self.font_check = Some(rx);
+    }
+
+    /// Rescan the fonts once [`Self::refresh_installed_fonts`]'s look says they changed.
+    fn poll_font_check(&mut self, ctx: &egui::Context) {
+        let Some(check) = &self.font_check else { return };
+        match check.try_recv() {
+            Ok(changed) => {
+                self.font_check = None;
+                if changed {
+                    // A failure shows in the status bar, as the menu item's does.
+                    let _ = self.run("text.rescanFonts", json!({}));
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.font_check = None,
+        }
+    }
+
+    /// Inject synthetic events (one press/release step or wheel turn per frame). Handlers read the
+    /// modifiers egui holds (`i.modifiers`), so a synthetic key, button or wheel turn holds its own
+    /// for the frames it spans (a drag's moves included); the keyboard's come back after.
+    pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
+        // The native menu's key equivalents become the input their keys make, ahead of what came
+        // after them (see `native_menu`).
+        let keys = self.services.native_menu.as_mut().map(native_menu::NativeMenu::take_keys).unwrap_or_default();
+        if !keys.is_empty() {
+            let events: Vec<egui::Event> = keys.into_iter().flat_map(|k| native_menu::key_events(k, || self.system_clipboard_text())).collect();
+            raw.events.splice(0..0, events);
+        }
+        for e in &raw.events {
+            match e {
+                egui::Event::ModifiersChanged(m) => self.host_modifiers = *m,
+                egui::Event::WindowFocused(false) => self.host_modifiers = egui::Modifiers::NONE,
+                egui::Event::WindowFocused(true) => self.refresh_installed_fonts(),
+                _ => {}
+            }
+        }
+        let Some(first) = self.synthetic.first() else {
+            if std::mem::take(&mut self.synthetic_modifiers) {
+                raw.events.push(egui::Event::ModifiersChanged(self.host_modifiers));
+            }
+            return;
+        };
         // Pointer events go one per frame so egui sees presses, drags and releases as real input;
         // keyboard sequences go up to the key release.
-        let n = match self.synthetic[0] {
-            egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } => 1,
+        let n = match first {
+            egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. } => 1,
             _ => self.synthetic.iter().position(|e| matches!(e, egui::Event::Key { pressed: false, .. })).map_or(self.synthetic.len(), |i| i + 1),
         };
-        if let Some(egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, .. }) = self.synthetic.first() {
+        if let egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, .. } = first {
             raw.events.push(egui::Event::PointerMoved(*p));
+        }
+        let (now, later) = self.synthetic.split_at(n.min(self.synthetic.len()));
+        // This frame's key or button, else the button a drag holds down (released later).
+        let held = now
+            .iter()
+            .find_map(|e| match e {
+                egui::Event::Key { modifiers, .. } | egui::Event::PointerButton { modifiers, .. } | egui::Event::MouseWheel { modifiers, .. } => {
+                    Some(*modifiers)
+                }
+                _ => None,
+            })
+            .or_else(|| match later.iter().find(|e| matches!(e, egui::Event::PointerButton { .. })) {
+                Some(egui::Event::PointerButton { pressed: false, modifiers, .. }) => Some(*modifiers),
+                _ => None,
+            });
+        match held {
+            Some(m) => {
+                raw.events.push(egui::Event::ModifiersChanged(m));
+                self.synthetic_modifiers = true;
+            }
+            None if std::mem::take(&mut self.synthetic_modifiers) => raw.events.push(egui::Event::ModifiersChanged(self.host_modifiers)),
+            None => {}
         }
         raw.events.extend(self.synthetic.drain(..n));
     }
@@ -522,6 +1007,9 @@ impl VectorcraftApp {
             return;
         }
         let t0 = now_ms();
+        scrub::begin_frame(self, &ctx);
+        font_menu::end_stale_preview(self, &ctx);
+        floating::track(self, &ctx);
         let t = theme::Tokens::get(&ctx);
         if self.ui.screen_mode < 2 {
             chrome::app_bar(self, ui);
@@ -546,12 +1034,16 @@ impl VectorcraftApp {
             canvas::show(self, ui);
         });
         dock::floating_panel(self, &ctx);
+        floating::show(self, &ctx);
         panels::library_panel::show_window(self, &ctx);
         dialogs::show(self, &ctx);
         palette::show(self, &ctx);
         if self.custom_titlebar {
             titlebar::resize_zones(ui);
         }
+        self.ui_fonts.frame(&ctx);
+        scrub::end_frame(self, &ctx);
+        native_menu::sync(self, &ctx);
         self.perf.frame_ms = now_ms() - t0;
         let _ = json!(null);
     }

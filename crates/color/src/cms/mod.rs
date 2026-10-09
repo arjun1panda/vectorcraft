@@ -33,6 +33,8 @@ pub const PROPHOTO_RGB: &str = "ProPhoto RGB";
 pub const GENERIC_CMYK: &str = "VectorCraft Generic CMYK (SWOP-like)";
 /// Profile-free CMYK (`rgb = (1−c)(1−k)` …): uncalibrated, kept for legacy numbers.
 pub const DEVICE_CMYK: &str = "Device CMYK (uncalibrated)";
+/// The grey space greyscale exports are written in: sRGB's tone curve (a grey shows as on screen).
+pub const GRAY: &str = "Gray (sRGB tone curve)";
 
 /// Built-in RGB and CMYK working spaces, in menu order.
 const BUILTIN_RGB: [&str; 4] = [SRGB, WIDE_GAMUT_RGB, DISPLAY_P3, PROPHOTO_RGB];
@@ -252,6 +254,33 @@ pub fn register_icc(bytes: &[u8], name: Option<String>) -> Result<ProfileInfo, C
     Ok(info)
 }
 
+/// Profile `name` as an ICC file to embed in an export: any RGB or CMYK profile of [`profiles`]
+/// (by its current or legacy name), or [`GRAY`]. Built-in profiles are written in code from the
+/// CMS: the RGB spaces from their primaries, the CMYK spaces as lookup tables sampled from their
+/// model (both directions, perceptual and relative colorimetric, Lab PCS); a profile the user
+/// loaded is the file it came from. Cached.
+pub fn icc_bytes(name: &str) -> Result<Arc<[u8]>, CmsError> {
+    static CACHE: Mutex<Vec<(String, Arc<[u8]>)>> = Mutex::new(Vec::new());
+    let name = canonical_name(name);
+    if let Some(p) = user_profile(name) {
+        return p.bytes().map(Arc::from);
+    }
+    if let Some((_, b)) = CACHE.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| n == name) {
+        return Ok(b.clone());
+    }
+    let bytes: Arc<[u8]> = if name == GRAY {
+        icc::encode(&icc::gray_profile(name))?
+    } else if BUILTIN_CMYK.contains(&name) {
+        let cms = Cms::new(&ColorSettings { cmyk: name.into(), ..ColorSettings::default() })?;
+        icc::encode(&icc::cmyk_profile(name, |c| cms.cmyk_to_lab(c), |l| cms.lab_to_cmyk(l, Intent::RelativeColorimetric)))?
+    } else {
+        icc::builtin_rgb_bytes(name)?
+    }
+    .into();
+    CACHE.lock().unwrap_or_else(|e| e.into_inner()).push((name.to_string(), bytes.clone()));
+    Ok(bytes)
+}
+
 /// Load a `.icc`/`.icm` file from disk (native only).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_icc_file(path: &std::path::Path) -> Result<ProfileInfo, CmsError> {
@@ -327,9 +356,36 @@ impl Cms {
         }
     }
 
-    /// CMYK in the working space → display sRGB (`absolute` simulates the paper colour).
+    /// CMYK in the working space → display sRGB (`absolute` simulates the paper colour). An ICC
+    /// CMYK profile converts as [`Self::cmyk_to_rgb`] does into sRGB (with the settings'
+    /// black-point compensation), so what shows is what an RGB export writes.
     pub fn cmyk_to_srgb(&self, cmyk: [f32; 4], absolute: bool) -> [f32; 3] {
+        if let (false, CmykSpace::Icc(p)) = (absolute, &self.cmyk)
+            && let Some(srgb) = builtin_rgb_cache(SRGB)
+            && let Some(v) = p.to_rgb_of(&srgb, &cmyk.map(|v| v.clamp(0.0, 1.0)), Intent::RelativeColorimetric, self.settings.bpc)
+        {
+            return v;
+        }
         Self::cmyk_to_srgb_in(&self.cmyk, cmyk, absolute)
+    }
+    /// CMYK in the working space → working RGB with `intent`. An ICC CMYK profile converts
+    /// directly into the RGB profile: not through display sRGB, which would clip colours a wider
+    /// RGB space holds (Wide Gamut RGB keeps CMYK cyan that sRGB can't show), and with the
+    /// settings' black-point compensation. The built-in CMYK spaces go through sRGB as before
+    /// (Generic CMYK compensates in its own model).
+    pub fn cmyk_to_rgb(&self, cmyk: [f32; 4], intent: Intent) -> [f32; 3] {
+        let cmyk = cmyk.map(|v| v.clamp(0.0, 1.0));
+        let src = match &self.cmyk {
+            CmykSpace::Icc(p) => Some(p.clone()),
+            CmykSpace::Generic(_) | CmykSpace::Device => None,
+        };
+        let dest = match &self.rgb {
+            RgbSpace::Icc(p) => Some(p.clone()),
+            RgbSpace::Srgb => builtin_rgb_cache(SRGB),
+        };
+        src.zip(dest)
+            .and_then(|(s, d)| s.to_rgb_of(&d, &cmyk, intent, self.settings.bpc))
+            .unwrap_or_else(|| self.srgb_to_rgb(self.cmyk_to_srgb(cmyk, false)))
     }
     /// Display sRGB → working CMYK with `intent`.
     pub fn srgb_to_cmyk(&self, srgb: [f32; 3], intent: Intent) -> [f32; 4] {
@@ -394,6 +450,10 @@ impl Cms {
             (_, Model::Cmyk) => {
                 let [c, m, y, k] = self.to_cmyk(c, intent);
                 Color::Cmyk { c, m, y, k }
+            }
+            (Color::Cmyk { c, m, y, k }, Model::Rgb) => {
+                let [r, g, b] = self.cmyk_to_rgb([*c, *m, *y, *k], intent);
+                Color::Rgb { r, g, b }
             }
             (_, Model::Rgb) => {
                 let [r, g, b] = self.srgb_to_rgb(self.display_rgb(c));
@@ -633,6 +693,60 @@ impl ProofLut {
     }
 }
 
+/// A 17⁴ CMYK → four values lookup table with quadrilinear interpolation: ink amounts to a
+/// colour (XYZ, RGB, or CMYK in another space).
+pub struct CmykLut {
+    data: Vec<[f32; 4]>,
+}
+
+impl CmykLut {
+    pub fn build(f: impl Fn([f32; 4]) -> [f32; 4]) -> Self {
+        let s = (LUT_N - 1) as f32;
+        let mut data = Vec::with_capacity(LUT_N.pow(4));
+        for c in 0..LUT_N {
+            for m in 0..LUT_N {
+                for y in 0..LUT_N {
+                    for k in 0..LUT_N {
+                        data.push(f([c, m, y, k].map(|i| i as f32 / s)));
+                    }
+                }
+            }
+        }
+        Self { data }
+    }
+
+    pub fn apply(&self, inks: [f32; 4]) -> [f32; 4] {
+        const STRIDE: [usize; 4] = [LUT_N * LUT_N * LUT_N, LUT_N * LUT_N, LUT_N, 1];
+        let p = inks.map(|v| v.clamp(0.0, 1.0) * (LUT_N - 1) as f32);
+        let i = p.map(|v| (v as usize).min(LUT_N - 2));
+        let base: usize = (0..4).map(|d| i[d] * STRIDE[d]).sum();
+        let mut out = [0.0f32; 4];
+        for corner in 0..16 {
+            let (mut w, mut at) = (1.0f32, base);
+            for d in 0..4 {
+                let t = p[d] - i[d] as f32;
+                if corner >> d & 1 == 1 {
+                    w *= t;
+                    at += STRIDE[d];
+                } else {
+                    w *= 1.0 - t;
+                }
+            }
+            if w > 0.0 {
+                for (o, v) in out.iter_mut().zip(self.data[at]) {
+                    *o += w * v;
+                }
+            }
+        }
+        out
+    }
+
+    /// [`Self::apply`] to 8-bit ink amounts, for 8-bit values.
+    pub fn apply8(&self, inks: [u8; 4]) -> [u8; 4] {
+        self.apply(inks.map(|v| v as f32 / 255.0)).map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+    }
+}
+
 // ---------- the active (process-wide) settings ----------
 
 static ACTIVE: RwLock<Option<Arc<Cms>>> = RwLock::new(None);
@@ -671,3 +785,5 @@ pub(crate) fn cmyk_is_device() -> bool {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_icc;

@@ -19,7 +19,7 @@ pub const OPTIONS: &[FormatOption] = &[
         name: "useArtboards",
         ty: "boolean",
         default: "true",
-        description: "false: one SVG of the bounds of all art instead of artboards (several artboards write one file each)",
+        description: "false: one SVG of the bounds of all art instead of artboards (several artboards write one file each; a named artboard's file holds only the art over it)",
     },
     FormatOption {
         name: "styling",
@@ -31,7 +31,7 @@ pub const OPTIONS: &[FormatOption] = &[
         name: "outlineText",
         ty: "boolean",
         default: "false",
-        description: "Fonts: text as glyph outlines (viewable without the fonts) instead of <text>",
+        description: "Fonts: text as glyph outlines (viewable without the fonts) instead of <text>; default: Document Setup → Type → Export (Preserve Text Appearance: true)",
     },
     FormatOption {
         name: "images",
@@ -54,12 +54,41 @@ pub const OPTIONS: &[FormatOption] = &[
         default: "false",
         description: "embed the native document in <metadata> so VectorCraft reopens the SVG with nothing lost",
     },
-    FormatOption { name: "metadata", ty: "boolean", default: "false", description: "write <metadata> with the title and format (Dublin Core)" },
+    FormatOption {
+        name: "metadata",
+        ty: "boolean",
+        default: "false",
+        description: "write <metadata> with the title, format and File Info (Dublin Core)",
+    },
     FormatOption {
         name: "fewerTspans",
         ty: "boolean",
         default: "false",
         description: "type: one positioned <tspan> per line instead of one per style run, tab and justified word (smaller; viewers space the line themselves)",
+    },
+    FormatOption {
+        name: "hiddenLayers",
+        ty: "boolean",
+        default: "false",
+        description: "keep hidden layers and objects, not displayed (display=\"none\"); document.save sets it unless given",
+    },
+    FormatOption {
+        name: "encoding",
+        ty: "string",
+        default: "\"utf8\"",
+        description: "utf8 | utf16 (big-endian, with a byte order mark) | latin1 (ISO 8859-1; other characters as &#x…; references)",
+    },
+    FormatOption {
+        name: "profile",
+        ty: "string",
+        default: "\"svg11\"",
+        description: "svg11 (SVG 1.1) | tiny12 (SVG Tiny 1.2, simplified: presentation attributes only; no filters, masks, symbols, blend modes or embedded fonts)",
+    },
+    FormatOption {
+        name: "embedFonts",
+        ty: "boolean",
+        default: "false",
+        description: "embed the fonts type uses as @font-face, subset to the characters used (whole when the font's licence forbids subsetting, left out with a warning when it forbids embedding)",
     },
     FormatOption {
         name: "svg",
@@ -96,30 +125,43 @@ pub fn options_map(p: &Value) -> Result<Map<String, Value>, String> {
     Ok(m)
 }
 
-/// The writer options and the artboards (`None`: the art bounds) an SVG export of `doc` covers.
-fn plan(doc: &Document, p: &Value) -> Result<(ExportOptions, Vec<Option<usize>>), String> {
+/// The writer options and the artboards (`None`: the art bounds) an SVG export of `doc` covers,
+/// and whether `p` named those artboards (else the first stands for the whole document, as Save
+/// writes it).
+fn plan(doc: &Document, p: &Value) -> Result<(ExportOptions, Vec<Option<usize>>, bool), String> {
     let mut m = options_map(p)?;
+    // Fonts: unless chosen, Document Setup → Type → Export decides (appearance = outlines).
+    if !m.contains_key("outlineText") && doc.setup.export_text == vectorcraft_doc::ExportText::Appearance {
+        m.insert("outlineText".into(), Value::Bool(true));
+    }
     let picks: Map<String, Value> = ARTBOARD_PARAMS.iter().chain(["useArtboards"].iter()).filter_map(|k| m.remove_entry(*k)).collect();
     let boards = Boards::deserialize(Value::Object(picks)).map_err(|e| format!("SVG options: {e}"))?;
     let opts = ExportOptions::deserialize(Value::Object(m)).map_err(|e| format!("SVG options: {e}"))?;
     opts.check().map_err(|e| format!("SVG options: {e}"))?;
     let n = doc.artboards.len();
     if n == 0 || boards.use_artboards == Some(false) {
-        return Ok((opts, vec![None]));
+        return Ok((opts, vec![None], false));
     }
-    let picked = boards.pick.resolve(n)?.unwrap_or_else(|| vec![0]);
-    Ok((opts, picked.into_iter().map(Some).collect()))
+    let named = boards.pick.resolve(n)?;
+    let chosen = named.is_some();
+    Ok((opts, named.unwrap_or_else(|| vec![0]).into_iter().map(Some).collect(), chosen))
 }
 
 /// Encode `doc` as SVG (or gzipped, SVGZ): one file per chosen artboard, with the images they
 /// link to and the writer's warnings.
 pub(super) fn encode(doc: &Document, p: &Value, compressed: bool) -> Result<Encoded, String> {
-    let (opts, boards) = plan(doc, p)?;
+    let (opts, boards, chosen) = plan(doc, p)?;
     // Preserve editing embeds the native document (once, shared by every file).
     let native = opts.preserve_editing.then(|| vectorcraft_format::save(doc, false));
+    // SVG has no filters for the Photoshop-style effects: their objects go in as images.
+    let flat = crate::cmd::rasterfx::flatten_pixel_effects(doc);
+    let doc = flat.as_ref().unwrap_or(doc);
     let mut enc = Encoded::default();
     for artboard in boards {
-        let out = vectorcraft_svg::export_full(doc, &ExportOptions { artboard, ..opts.clone() }, native.as_deref());
+        // A chosen artboard's file holds the art over it (#550).
+        let over = artboard.filter(|_| chosen).and_then(|b| doc.artboards.get(b)).map(|a| super::export::art_over(doc, a.rect));
+        let mut out = vectorcraft_svg::export_full(over.as_ref().unwrap_or(doc), &ExportOptions { artboard, ..opts.clone() }, native.as_deref());
+        let bytes = out.take_bytes();
         for l in out.linked {
             if !enc.linked.iter().any(|e| e.name == l.name) {
                 enc.linked.push(l);
@@ -130,7 +172,13 @@ pub(super) fn encode(doc: &Document, p: &Value, compressed: bool) -> Result<Enco
                 enc.warnings.push(w);
             }
         }
-        enc.files.push((artboard, if compressed { vectorcraft_svg::compress(&out.svg) } else { out.svg.into_bytes() }));
+        enc.files.push((artboard, if compressed { vectorcraft_svg::compress_bytes(&bytes) } else { bytes }));
+    }
+    // Live type names its fonts; outlines and embedded fonts are the fallback font's.
+    if (opts.outline_text || opts.embed_fonts)
+        && let Some(w) = crate::cmd::fonts::substitution_warning(doc)
+    {
+        enc.warnings.push(w);
     }
     Ok(enc)
 }

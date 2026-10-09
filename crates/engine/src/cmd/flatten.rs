@@ -20,6 +20,7 @@
 //! Window → Flattener Preview: the same plan, worked out without rendering, reports what flattening
 //! the document would touch ([`FlattenReport`], `flattener.preview`).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,12 @@ pub struct FlattenOptions {
     /// Areas showing a single paint keep it (spot and process colours, swatches) with its
     /// overprint; off, the flattened objects lose their overprints.
     pub preserve_overprints: bool,
+    /// Flattening for files without any transparency (PDF/X-1a, PDF/X-3): images with
+    /// see-through pixels (these keys, [`see_through_images`]) count as transparency, and
+    /// rasterized areas clipped to their regions are opaque. `None` for ordinary flattening. Not a
+    /// preset option.
+    #[serde(skip)]
+    pub no_transparency: Option<BTreeSet<String>>,
 }
 
 impl Default for FlattenOptions {
@@ -175,6 +182,7 @@ impl FlattenOptions {
             anti_alias,
             preserve_alpha: false,
             preserve_overprints: true,
+            no_transparency: None,
         }
     }
 
@@ -194,6 +202,16 @@ impl FlattenOptions {
     /// The options `p` asks for, with the built-in presets only ([`Self::from_params_with`]).
     pub fn from_params(p: &Value) -> std::result::Result<Self, String> {
         Self::from_params_with(p, &[])
+    }
+
+    /// The options an export flattens with: preset `name` (built-in or one of `saved`; default
+    /// medium) with the export's `flattener` `options` over it.
+    pub fn for_export(name: Option<&str>, options: Option<&Value>, saved: &[FlattenerPreset]) -> std::result::Result<Self, String> {
+        let mut q = json!({ "options": options.cloned().unwrap_or(Value::Null) });
+        if let Some(name) = name {
+            q["preset"] = json!(name);
+        }
+        Self::from_params_with(&q, saved)
     }
 
     /// The options `p` asks for: `preset` (built-in or one of `saved`; default medium) adjusted by
@@ -220,6 +238,11 @@ impl FlattenOptions {
             return Err("resolutions must be between 1 and 2400 ppi".into());
         }
         Ok(o)
+    }
+
+    /// `n` shows an image whose see-through pixels count as transparency.
+    fn draws_see_through_image(&self, n: &Node) -> bool {
+        self.no_transparency.as_ref().is_some_and(|keys| draws_image(n, keys))
     }
 
     /// Whether a group that splits into `regions` atomic regions is rasterized whole.
@@ -792,7 +815,7 @@ fn plan(src: &Document, roots: &[NodeId], o: &FlattenOptions, render: bool) -> R
     let mut sc = Scratch { brushes: vectorcraft_brush::library(&baked), doc: baked.clone() };
     let plain: Vec<Node> = art.iter().map(|n| sc.plain(n)).collect();
     let reaches: Vec<Option<Rect>> = plain.iter().map(reach).collect();
-    let see_through: Vec<bool> = plain.iter().map(Node::shows_transparency).collect();
+    let see_through: Vec<bool> = plain.iter().map(|n| n.shows_transparency() || o.draws_see_through_image(n)).collect();
     let cmyk = src.color_mode == ColorMode::Cmyk;
     let mut out = Plan { flat: vec![], kept: vec![], transparent: roots.iter().zip(&see_through).filter(|(_, t)| **t).map(|(id, _)| *id).collect() };
     for g in overlapping(&reaches) {
@@ -927,7 +950,13 @@ fn render_raster(doc: &Document, art: &[Node], rect: Rect, ppi: f64, clip: Optio
     );
     let mut r = vectorcraft_render::Renderer::new();
     let mut img = r.render_region(&isolated_doc(doc, art.to_vec()), region, scale, !o.preserve_alpha);
-    if !o.preserve_alpha || !o.anti_alias {
+    if o.no_transparency.is_some() && clip.is_some() && !o.preserve_alpha {
+        // Without transparency the clip alone shapes the image: it is opaque, over white (its
+        // edge pixels too).
+        for p in img.pixels.as_chunks_mut::<4>().0 {
+            p[3] = 255;
+        }
+    } else if !o.preserve_alpha || !o.anti_alias {
         // The art's coverage: drawn opaque, so only its own edges (and soft effects) are partial.
         let cover: Vec<Node> = art
             .iter()
@@ -981,6 +1010,28 @@ fn opaque(n: &mut Node) {
             opaque(Arc::make_mut(c));
         }
     }
+}
+
+/// `doc` with everything it draws flattened with `o`, as formats without transparency (EPS)
+/// write it: every visible object of the visible layers, locked ones too (a clipping layer's
+/// clipping path stays). `None` when that changes nothing.
+pub(crate) fn flatten_document(doc: &Document, o: &FlattenOptions) -> Result<Option<Document>> {
+    let outlining = o.text_to_outlines || o.strokes_to_outlines || !o.preserve_overprints;
+    if !outlining && !doc.layers.iter().any(|l| l.shows_transparency() || o.draws_see_through_image(l)) {
+        return Ok(None);
+    }
+    let mut roots = vec![];
+    for l in doc.layers.iter().filter(|l| l.visible && !matches!(l.kind, NodeKind::Layer { template: true, .. })) {
+        let children = l.children().map_or(&[][..], Vec::as_slice);
+        roots.extend(children.iter().skip(usize::from(l.clips())).filter(|c| c.visible).map(|c| c.id));
+    }
+    let plan = plan(doc, &roots, o, true)?;
+    if plan.flat.is_empty() && !plan.kept.iter().any(|id| doc.node(*id).is_some_and(|n| kept_work(n, o))) {
+        return Ok(None);
+    }
+    let mut d = doc.clone();
+    apply(&mut d, &mut vectorcraft_doc::Selection::default(), plan, o)?;
+    Ok(Some(d))
 }
 
 // ---------- apply ----------
@@ -1038,15 +1089,13 @@ fn apply(d: &mut Document, sel: &mut vectorcraft_doc::Selection, plan: Plan, o: 
 /// An image of `r` (in a clip group when it is clipped).
 fn raster_node(d: &mut Document, r: Raster) -> Node {
     let key = unique_key(d, "flattened");
-    d.images.insert(key.clone(), ImageBlob { mime: "image/png".into(), bytes: Arc::new(r.png) });
-    let image = Node::new(d.alloc_id(), NodeKind::Image(ImageObject { key, width: r.width, height: r.height, xf: r.xf, link: None }));
+    d.images.insert(key.clone(), ImageBlob::new("image/png", r.png));
+    let image = Node::new(
+        d.alloc_id(),
+        NodeKind::Image(ImageObject { key, width: r.width, height: r.height, xf: r.xf, link: None, placement: Default::default() }),
+    );
     let Some(path) = r.clip else { return image };
-    let mut clip = shape_node(d, path, None);
-    clip.appearance = Appearance::basic(Paint::None, Paint::None, 0.0);
-    if let NodeKind::Path { clipping, .. } = &mut clip.kind {
-        *clipping = true;
-    }
-    Node::new(d.alloc_id(), NodeKind::Group { children: vec![Arc::new(clip), Arc::new(image)], clip: true })
+    super::rasterfx::clip_group(d, path, FillRule::NonZero, image)
 }
 
 /// Replace the type under `root` by its outlines: → the id now standing for `root`.
@@ -1136,6 +1185,8 @@ impl Scratch {
                 let art = self.doc.symbols.iter().find(|s| &s.name == symbol).map(|s| vectorcraft_render::instance_art(&s.art, n));
                 art.and_then(|a| effects::outline_art(n, Some(&a))).map(|g| carry(n, g))
             }
+            // A placed document stays one: its art's resources aren't the document's.
+            NodeKind::PlacedDocument(_) => None,
             NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Repeat(_) => {
                 let hook: &dyn Fn(&Node) -> Option<Node> = &effects::outline_text;
                 Some(carry(n, vectorcraft_doc::live::expanded_group(n, Some(hook))))
@@ -1177,6 +1228,25 @@ fn carry(from: &Node, mut to: Node) -> Node {
     to
 }
 
+/// The keys of `doc`'s images that have see-through pixels (an alpha channel that isn't opaque
+/// everywhere).
+pub(crate) fn see_through_images(doc: &Document) -> BTreeSet<String> {
+    let see_through = |b: &ImageBlob| {
+        b.mime != "image/jpeg" && image::load_from_memory(&b.bytes).is_ok_and(|i| i.color().has_alpha() && i.to_rgba8().pixels().any(|p| p[3] < 255))
+    };
+    doc.images.iter().filter(|(_, b)| see_through(b)).map(|(k, _)| k.clone()).collect()
+}
+
+/// `n` shows an image of `keys` (itself or inside).
+fn draws_image(n: &Node, keys: &BTreeSet<String>) -> bool {
+    !keys.is_empty()
+        && n.visible
+        && match &n.kind {
+            NodeKind::Image(im) => keys.contains(&im.key),
+            _ => n.children().is_some_and(|ch| ch.iter().any(|c| draws_image(c, keys))),
+        }
+}
+
 fn visible_fx(fx: &[Effect]) -> bool {
     fx.iter().any(|e| e.visible)
 }
@@ -1195,11 +1265,11 @@ fn reach(n: &Node) -> Option<Rect> {
     if !n.visible {
         return None;
     }
-    let fx = n.appearance.items.iter().map(|i| effects::outset(i.effects())).fold(effects::outset(&n.appearance.effects), f64::max);
     let b = match n.children() {
         Some(ch) if !n.clips() && !matches!(n.kind, NodeKind::Compound { .. }) => ch.iter().filter_map(|c| reach(c)).reduce(|a, b| a.union(b))?,
         _ => n.visual_bounds()?,
     };
+    let fx = n.appearance.items.iter().map(|i| effects::outset(i.effects(), b)).fold(effects::outset(&n.appearance.effects, b), f64::max);
     Some(b.inflate(fx + 1.0, fx + 1.0))
 }
 

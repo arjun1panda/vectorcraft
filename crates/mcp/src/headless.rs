@@ -26,11 +26,23 @@ impl Default for Headless {
 /// `run_command` behaves the same in both modes.
 const HOST_COMMANDS: &[(&str, &str, &str)] = &[
     ("file.open", "Open…", "{path} open any readable file (see document.formats) as a new document; templates open untitled"),
-    ("file.save", "Save", "{path?} save as .vectorcraft (default: the document's path)"),
-    ("file.saveAs", "Save As…", "{path}"),
+    (
+        "file.save",
+        "Save",
+        "{path?, format?, options?, svg?: {…SVG options}} = document.save: .vectorcraft, .ai (a PDF that reopens editable), .pdf, .svg or .svgz (default: the document's own path and format)",
+    ),
     ("file.export", "Export…", "{path?, format?, artboard?, range?, scale?, …} = document.export (no path → dataBase64)"),
-    ("file.exportForScreens", "Export for Screens…", "{folder?, artboards? | range?, formats?, prefix?} = document.exportForScreens"),
+    (
+        "file.exportForScreens",
+        "Export for Screens…",
+        "{folder?, zip?, artboards? | range? | fullDocument? | assets?, includeBleed?, subfolders?, preset?, formats?, settings?, prefix?} = document.exportForScreens (no folder → the files, or one zip, as dataBase64)",
+    ),
     ("tool.select", "Select Tool", "{tool} e.g. selection, directSelection, pen, rectangle, ellipse, polygon, star, lineSegment"),
+    (
+        "tool.setOption",
+        "Tool Option",
+        "{key, value} | {values: {key: value…}}, tool?: id (default: the active tool) → the tool's options (`{}` reads them); kept options last across tool switches",
+    ),
 ];
 
 fn s<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
@@ -61,6 +73,7 @@ fn tool_key(name: &str) -> Option<ToolKey> {
         "[" | "bracketleft" | "openbracket" => ToolKey::BracketLeft,
         "]" | "bracketright" | "closebracket" => ToolKey::BracketRight,
         "tab" => ToolKey::Tab,
+        k if k.len() == 1 => ToolKey::Digit(k.parse().ok()?),
         _ => return None,
     })
 }
@@ -102,10 +115,11 @@ impl Headless {
     fn exec(&mut self, id: &str, params: &Value) -> Result<Value, String> {
         match id {
             "file.open" => self.open(params),
-            "file.save" | "file.saveAs" => self.save(params),
+            "file.save" => self.save(params),
             "file.export" => self.export(params),
             "file.exportForScreens" => self.session.execute("document.exportForScreens", params).map_err(|e| e.to_string()),
             "tool.select" => self.select_tool(params),
+            "tool.setOption" => self.session.set_tool_option_cmd(params),
             _ => self.session.execute(id, params).map_err(|e| e.to_string()),
         }
     }
@@ -134,6 +148,7 @@ impl Headless {
                     self.session.select_tool(&t, self.view).map_err(|e| e.to_string())?;
                 }
                 UiRequest::Dialog(k, p) => out.push(json!({"dialog": k, "params": p})),
+                UiRequest::Status(msg) => out.push(json!({"status": msg})),
             }
         }
         Ok(())
@@ -153,9 +168,14 @@ impl Headless {
             let x = e.get("x").and_then(Value::as_f64).ok_or("pointer event needs numeric `x`")?;
             let y = e.get("y").and_then(Value::as_f64).ok_or("pointer event needs numeric `y`")?;
             let mods = e.get("mods").and_then(|m| serde_json::from_value(m.clone()).ok()).unwrap_or(base);
-            let ev = PointerEvent { kind, pos: Point::new(x, y), mods, pressure: 1.0 };
+            let ev = PointerEvent { kind, pos: Point::new(x, y), mods, pressure: PointerEvent::json_pressure(e) };
             let reqs = self.session.pointer(&ev, self.view).map_err(|e| e.to_string())?;
             self.apply_ui_requests(reqs, &mut requests)?;
+            let hold = PointerEvent::json_hold(e);
+            if hold > 0.0 {
+                let reqs = self.session.tool_tick(hold, self.view).map_err(|e| e.to_string())?;
+                self.apply_ui_requests(reqs, &mut requests)?;
+            }
         }
         let sel = self.session.active().map(|d| d.selection.objects.iter().map(|i| i.0).collect::<Vec<_>>()).unwrap_or_default();
         Ok(json!({"selection": sel, "tool": self.session.tool_id(), "requests": requests}))
@@ -183,6 +203,11 @@ impl Headless {
         if let Some(t) = TOOL_GROUPS.iter().flat_map(|g| g.iter()).find(|t| t.shortcut.is_some_and(|sc| shortcut_matches(sc, key, mods))) {
             self.session.select_tool(t.id, self.view).map_err(|e| e.to_string())?;
             return Ok(json!({"handledBy": "tool.select", "tool": t.id}));
+        }
+        // Backspace clears the selection as Delete does (as in the desktop app).
+        if tk == Some(ToolKey::Backspace) && mods == Mods::default() && self.session.active().is_some_and(|d| !d.selection.is_empty()) {
+            let r = self.exec("edit.clear", &json!({}))?;
+            return Ok(json!({"handledBy": "command", "command": "edit.clear", "result": r}));
         }
         if let Some(k) = tk {
             let mut out = vec![];
@@ -217,7 +242,8 @@ impl Headless {
         self.session.execute("document.open", &json!({"path": path})).map_err(|e| e.to_string())
     }
 
-    /// `app.save {path?}`: native format; remembers the path and clears the dirty flag.
+    /// `app.save {path?, format?, options?}`: `document.save` (by default the document's own path and
+    /// format); remembers the path and clears the dirty flag.
     pub fn save(&mut self, p: &Value) -> Result<Value, String> {
         let st = self.session.active().ok_or("no document")?;
         if s(p, "path").is_none() && st.path.is_none() {
@@ -245,7 +271,7 @@ impl Backend for Headless {
                 self.exec(&id, &params)
             }
             "engine.commands" => Ok(self.commands()),
-            "document.inspect" => self.exec("document.inspect", &json!({})),
+            "document.inspect" => self.exec("document.inspect", p),
             "document.node" => self.exec("document.node", p),
             "document.json" => self.exec("document.json", &json!({})),
             "ui.tool.select" => self.select_tool(p),

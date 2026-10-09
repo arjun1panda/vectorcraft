@@ -29,6 +29,9 @@ use crate::widgets::{self, Live};
 
 pub(super) const SPEC: DialogSpec = DialogSpec::window(show, confirm);
 
+/// The field holding the frame the popover was first drawn in.
+const OPENED: &str = "__opened";
+
 /// What the popover edits: the selected stop of the gradient behind the active proxy (with all
 /// its stops), or the selected point of a freeform gradient.
 enum Target {
@@ -100,7 +103,7 @@ fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
             egui::Frame::popup(&ctx.global_style()).fill(t.panel).inner_margin(egui::Margin::same(10)).show(ui, |ui| {
                 ui.set_width(250.0);
                 ui.horizontal(|ui| {
-                    for (icon, tip, on) in [("palette", "Color", !swatches), ("swatch-book", "Swatches", swatches)] {
+                    for (icon, tip, on) in [("palette", tl!("Color"), !swatches), ("swatch-book", tl!("Swatches"), swatches)] {
                         if widgets::icon_button(ui, icon, tip, on, 24.0).clicked() {
                             tab = Some(if icon == "palette" { "color" } else { "swatches" });
                         }
@@ -115,13 +118,13 @@ fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    widgets::dim_label(ui, "Opacity:");
+                    widgets::dim_label(ui, tl!("Opacity:"));
                     if let Some(v) = widgets::plain_field(ui, "stop-pop-op", target.opacity() as f64 * 100.0, "%", 0, 54.0) {
                         apply(app, &target, &json!({ "opacity": v }));
                     }
                     let (label, key, value) = match &target {
-                        Target::Stop(stops, i) => ("Location:", "location", stops[*i].offset),
-                        Target::Point(p, _) => ("Spread:", "spread", p.spread),
+                        Target::Stop(stops, i) => (tl!("Location:"), "location", stops[*i].offset),
+                        Target::Point(p, _) => (tl!("Spread:"), "spread", p.spread),
                     };
                     widgets::dim_label(ui, label);
                     if let Some(v) = widgets::plain_field(ui, ("stop-pop", key), value as f64 * 100.0, "%", 1, 54.0) {
@@ -131,12 +134,18 @@ fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
             });
         })
         .response;
-    if let (Some(tab), Some(d)) = (tab, app.ui.dialog.as_mut()) {
-        d.fields.insert("tab".into(), json!(tab));
+    // The frame it opened in (its first drawn).
+    let frame = ctx.cumulative_frame_nr();
+    let opened = d.fields.get(OPENED).and_then(Value::as_u64).unwrap_or(frame);
+    if let Some(d) = app.ui.dialog.as_mut() {
+        if let Some(tab) = tab {
+            d.fields.insert("tab".into(), json!(tab));
+        }
+        d.fields.insert(OPENED.into(), json!(opened));
     }
-    // The double-click that opened the popover lands on its chip, outside it: only a later click
-    // elsewhere closes it.
-    if resp.clicked_elsewhere() && !ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+    // The click that opened the popover (the Gradient panel's colour chip) or the double-click
+    // (a stop's chip) lands outside it: only a later click elsewhere closes it (#577).
+    if frame > opened && resp.clicked_elsewhere() && !ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
         app.ui.dialog = None;
     }
 }
@@ -145,7 +154,7 @@ fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
 fn swatch_grid(app: &mut VectorcraftApp, ui: &mut egui::Ui, target: &Target) {
     let colors = swatch_colors(app);
     if colors.is_empty() {
-        widgets::dim_label(ui, "The document has no colour swatches.");
+        widgets::dim_label(ui, tl!("The document has no colour swatches."));
         return;
     }
     let current = target.color();
@@ -246,10 +255,18 @@ mod tests {
         }
     }
 
+    thread_local! {
+        // One context per test, so frames follow one another as in the app.
+        static CTX: egui::Context = {
+            let ctx = egui::Context::default();
+            crate::theme::install_fonts(&ctx);
+            ctx
+        };
+    }
+
     /// One headless frame of the dialog layer and the shortcuts.
     fn frame(app: &mut VectorcraftApp, events: Vec<egui::Event>) {
-        let ctx = egui::Context::default();
-        crate::theme::install_fonts(&ctx);
+        let ctx = CTX.with(Clone::clone);
         let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
             crate::shortcuts::handle(app, ui.ctx());
             super::super::show(app, ui.ctx());
@@ -310,6 +327,25 @@ mod tests {
         assert!(app.ui.dialog.is_some(), "the opening double-click must not close it");
         frame(&mut app, vec![egui::Event::PointerMoved(at), click(at, true), click(at, false)]);
         assert!(app.ui.dialog.is_none(), "a click elsewhere closes it");
+    }
+
+    /// #577: the Gradient panel's colour chip opens it with a click whose release lands in the
+    /// frame it opens in, outside it: that click doesn't close it.
+    #[test]
+    fn the_click_that_opens_it_from_the_panel_keeps_it_open() {
+        let mut app = app();
+        let at = egui::pos2(5.0, 5.0);
+        frame(&mut app, vec![egui::Event::PointerMoved(at), click(at, true)]);
+        // The panel opens it while the click is released.
+        app.ui.dialog = Some(Dialog::new("gradientStop", json!({"index": 1, "screen": [200.0, 200.0], "tab": "color"})));
+        frame(&mut app, vec![click(at, false)]);
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        assert!(app.ui.dialog.is_some(), "the opening click must not close it");
+        let away = egui::pos2(5.0, 600.0);
+        frame(&mut app, vec![egui::Event::PointerMoved(away), click(away, true), click(away, false)]);
+        assert!(app.ui.dialog.is_none(), "a later click elsewhere closes it");
     }
 
     #[test]

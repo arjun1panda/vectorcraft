@@ -7,16 +7,21 @@
 //! Coordinates are document points (1/72 in), y pointing down.
 #![forbid(unsafe_code)]
 
+pub mod arc;
 pub mod bez;
+pub mod corners;
 pub mod hit;
 pub mod path;
+pub mod projective;
 pub mod recognize;
 pub mod shapes;
 pub mod snap;
 
+pub use arc::ArcPath;
 pub use kurbo;
 pub use kurbo::{Affine, BezPath, CubicBez, Line, ParamCurve, PathEl, PathSeg, Point, Rect, Shape, Size, Vec2};
 pub use path::{Anchor, AnchorKind, FillRule, PathData, SubPath};
+pub use projective::Homography;
 
 /// Tolerance used when comparing handle positions to anchor positions.
 pub const EPS: f64 = 1e-9;

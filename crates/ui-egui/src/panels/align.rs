@@ -52,30 +52,41 @@ pub const DISTRIBUTE: [(&str, &str, &str, &str); 6] = [
     ("dc-dist-right", "Horizontal Distribute Right", "horizontal", "right"),
 ];
 
+/// Whether the selection has a key object.
+fn has_key(app: &VectorcraftApp) -> bool {
+    app.session.active().is_some_and(|st| st.selection.key.is_some())
+}
+
+/// What Align aligns to: the key object while there is one (a click on an object of the
+/// selection makes it the key), else the Align To choice.
+fn align_to(app: &VectorcraftApp, ctx: &egui::Context) -> AlignTo {
+    if has_key(app) { AlignTo::Key } else { pstate(ctx, "align-to") }
+}
+
 pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let n = selection_len(app);
-    let to: AlignTo = pstate(ui.ctx(), "align-to");
-    widgets::subheader(ui, "Align Objects:");
+    let to = align_to(app, ui.ctx());
+    widgets::subheader(ui, tl!("Align Objects:"));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         for (i, (icon, tip, axis, v)) in ALIGN.iter().enumerate() {
             if i == 3 {
                 ui.add_space(6.0);
             }
-            if widgets::icon_button_enabled(ui, icon, tip, false, n >= 1, 32.0).clicked() {
+            if widgets::icon_button_enabled(ui, icon, tl!(tip), false, n >= 1, 32.0).clicked() {
                 app.run("object.align", align_params(json!({*axis: v}), to, n)).ok();
             }
         }
     });
     widgets::divider(ui);
-    widgets::subheader(ui, "Distribute Objects:");
+    widgets::subheader(ui, tl!("Distribute Objects:"));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 5.0;
         for (i, (icon, tip, axis, v)) in DISTRIBUTE.iter().enumerate() {
             if i == 3 {
                 ui.add_space(6.0);
             }
-            if widgets::icon_button_enabled(ui, icon, tip, false, n >= 2, 32.0).clicked() {
+            if widgets::icon_button_enabled(ui, icon, tl!(tip), false, n >= 2, 32.0).clicked() {
                 app.run("object.distribute", json!({*axis: v})).ok();
             }
         }
@@ -86,16 +97,16 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     widgets::divider(ui);
     ui.horizontal(|ui| {
         ui.vertical(|ui| {
-            widgets::subheader(ui, "Distribute Spacing:");
+            widgets::subheader(ui, tl!("Distribute Spacing:"));
             let spacing: f64 = pstate::<Option<f64>>(ui.ctx(), "align-spacing").unwrap_or(0.0);
             let key = to == AlignTo::Key;
             ui.horizontal(|ui| {
                 let on = n >= 2;
                 let sp = if key { Some(spacing) } else { None };
-                if widgets::icon_button_enabled(ui, "dc-dist-vspace", "Vertical Distribute Space", false, on, 28.0).clicked() {
+                if widgets::icon_button_enabled(ui, "dc-dist-vspace", tl!("Vertical Distribute Space"), false, on, 28.0).clicked() {
                     app.run("object.distributeSpacing", json!({"axis": "vertical", "spacing": sp})).ok();
                 }
-                if widgets::icon_button_enabled(ui, "dc-dist-hspace", "Horizontal Distribute Space", false, on, 28.0).clicked() {
+                if widgets::icon_button_enabled(ui, "dc-dist-hspace", tl!("Horizontal Distribute Space"), false, on, 28.0).clicked() {
                     app.run("object.distributeSpacing", json!({"axis": "horizontal", "spacing": sp})).ok();
                 }
                 ui.add_enabled_ui(key, |ui| {
@@ -107,15 +118,19 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         });
         ui.separator();
         ui.vertical(|ui| {
-            widgets::subheader(ui, "Align To:");
+            widgets::subheader(ui, tl!("Align To:"));
             ui.horizontal(|ui| {
                 for (v, icon, tip) in [
-                    (AlignTo::Selection, "dc-alignto-selection", "Align to Selection"),
-                    (AlignTo::Key, "dc-alignto-key", "Align to Key Object"),
-                    (AlignTo::Artboard, "dc-alignto-artboard", "Align to Artboard"),
+                    (AlignTo::Selection, "dc-alignto-selection", tl!("Align to Selection")),
+                    (AlignTo::Key, "dc-alignto-key", tl!("Align to Key Object")),
+                    (AlignTo::Artboard, "dc-alignto-artboard", tl!("Align to Artboard")),
                 ] {
-                    if widgets::icon_button(ui, icon, tip, to == v, 28.0).clicked() {
+                    if widgets::icon_button(ui, icon, tl!(tip), to == v, 28.0).clicked() {
                         set_pstate(ui.ctx(), "align-to", v);
+                        // Aligning to the selection or the artboard lets go of the key object.
+                        if v != AlignTo::Key && has_key(app) {
+                            app.run("select.key", json!({})).ok();
+                        }
                     }
                 }
             });
@@ -125,19 +140,18 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
 
 pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let hidden: bool = pstate(ui.ctx(), "align-hide-options");
-    if menu_item(ui, if hidden { "Show Options" } else { "Hide Options" }, true, false) {
+    if menu_item(ui, if hidden { tl!("Show Options") } else { tl!("Hide Options") }, true, false) {
         set_pstate(ui.ctx(), "align-hide-options", !hidden);
     }
     let pb = app.session.prefs.use_preview_bounds;
-    if menu_item(ui, "Use Preview Bounds", true, pb) {
+    if menu_item(ui, tl!("Use Preview Bounds"), true, pb) {
         super::transform::set_pref(app, "usePreviewBounds", !pb);
     }
-    let to: AlignTo = pstate(ui.ctx(), "align-to");
-    if menu_item(ui, "Cancel Key Object", to == AlignTo::Key, false) {
+    if menu_item(ui, tl!("Cancel Key Object"), align_to(app, ui.ctx()) == AlignTo::Key, false) {
         set_pstate(ui.ctx(), "align-to", AlignTo::Selection);
         app.run("select.key", json!({})).ok();
     }
-    menu_item(ui, "Align to Glyph Bounds", false, false);
+    menu_item(ui, tl!("Align to Glyph Bounds"), false, false);
 }
 
 #[cfg(test)]
@@ -151,5 +165,22 @@ mod tests {
         let p = align_params(json!({"vertical": "top"}), AlignTo::Selection, 3);
         assert_eq!(p["to"], "selection");
         assert_eq!(align_params(json!({}), AlignTo::Key, 1)["to"], "key");
+    }
+
+    /// #541: while the selection has a key object Align aligns to it, whatever Align To says;
+    /// choosing Align to Selection lets the key go.
+    #[test]
+    fn a_key_object_makes_align_align_to_it() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 200})).unwrap();
+        let a = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 10, "height": 10})).unwrap()["id"].clone();
+        let b = app.run("shape.rectangle", json!({"x": 80, "y": 50, "width": 30, "height": 30})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [a, b]})).unwrap();
+        let ctx = egui::Context::default();
+        assert_eq!(align_to(&app, &ctx), AlignTo::Selection);
+        app.run("select.key", json!({"id": b})).unwrap();
+        assert_eq!(align_to(&app, &ctx), AlignTo::Key);
+        app.run("select.key", json!({})).unwrap();
+        assert_eq!(align_to(&app, &ctx), AlignTo::Selection, "no key: the choice again");
     }
 }

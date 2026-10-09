@@ -100,9 +100,10 @@ fn type_picks_up_font_and_size() {
     assert!(width(&s, dst) > before, "laid out again at the new size");
     // Without character or paragraph attributes only the paints go.
     let dst2 = id_of(s.execute("text.create", &json!({"x": 10, "y": 500, "text": "Other"})).unwrap());
+    let preserved_alignment = style(&s, dst2).1;
     s.execute("appearance.copyFrom", &json!({"source": src.0, "pickUp": {"character": false, "paragraph": false}})).unwrap();
     let (st, justify) = style(&s, dst2);
-    assert_eq!((st.size, justify, st.fill.color().unwrap().to_hex()), (12.0, Justify::Left, "#00ff00".into()));
+    assert_eq!((st.size, justify, st.fill.color().unwrap().to_hex()), (12.0, preserved_alignment, "#00ff00".into()));
 }
 
 #[test]
@@ -157,7 +158,7 @@ fn clicking_an_image_samples_its_pixel() {
         let l = d.layers[0].id;
         let id = d.alloc_id();
         let xf = vectorcraft_geom::Affine::translate((300.0, 0.0)) * vectorcraft_geom::Affine::scale(100.0);
-        let im = ImageObject { key: "px".into(), width: 2, height: 1, xf, link: None };
+        let im = ImageObject { key: "px".into(), width: 2, height: 1, xf, link: None, placement: Default::default() };
         d.insert(Some(l), 0, Node::new(id, NodeKind::Image(im))).map_err(|e| crate::EngineError::Other(e.to_string()))
     })
     .unwrap();

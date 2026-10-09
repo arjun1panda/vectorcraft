@@ -1,6 +1,8 @@
 //! Commands backing the drawing tools (pencil, curvature, anchor tools, scissors, knife, eraser,
 //! blob brush, smooth, path eraser, join).
 
+use std::sync::Arc;
+
 use kurbo::{ParamCurve, ParamCurveNearest};
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
@@ -42,6 +44,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{id, subpath, anchor} remove one anchor, re-fitting the curve",
             has_doc,
             remove_anchor
+        ),
+        cmd!(
+            "path.removeAnchors",
+            "Remove Anchor Points",
+            ["Object", "Path"],
+            None,
+            "{} remove the direct-selected anchors without opening their paths, refitting the curve round each → {removedObjects}",
+            has_anchors,
+            remove_anchors
         ),
         cmd!(
             "path.convertAnchor",
@@ -224,19 +235,43 @@ fn target_paths(doc: &Document, sel: &Selection, area: Rect) -> Vec<NodeId> {
     out
 }
 
-/// A copy of path node `id` (fresh id, no live shape) with geometry `pd`.
+/// The members of a compound path with geometry `pd`: one path per subpath, with fresh ids.
+fn compound_members(d: &mut Document, pd: PathData) -> Vec<Arc<Node>> {
+    pd.subpaths.into_iter().map(|sp| Arc::new(Node::path(d.alloc_id(), PathData::single(sp), Appearance::default()))).collect()
+}
+
+/// Give path or compound path `id` the geometry `pd` (dropping a live shape; a compound's members
+/// are rebuilt, one per subpath).
+pub(super) fn set_geometry(d: &mut Document, id: NodeId, pd: PathData) -> Result<()> {
+    if matches!(d.node(id).map(|n| &n.kind), Some(NodeKind::Compound { .. })) {
+        let members = compound_members(d, pd);
+        if let Some(NodeKind::Compound { children, .. }) = d.node_mut(id).map(|n| &mut n.kind) {
+            *children = members;
+        }
+        return Ok(());
+    }
+    *path_mut(d, id)? = pd;
+    Ok(())
+}
+
+/// A copy of path or compound path node `id` (fresh ids, no live shape) with geometry `pd`.
 fn sibling_with(d: &mut Document, id: NodeId, pd: PathData) -> Result<Node> {
     let mut n = d.node(id).ok_or(EngineError::NoNode(id))?.clone();
     n.id = d.alloc_id();
-    if let NodeKind::Path { path, live, .. } = &mut n.kind {
-        *path = pd;
-        *live = None;
+    match &mut n.kind {
+        NodeKind::Path { path, live, .. } => {
+            *path = pd;
+            *live = None;
+        }
+        NodeKind::Compound { children, .. } => *children = compound_members(d, pd),
+        _ => {}
     }
     Ok(n)
 }
 
-/// Replace path `id` with `pieces` (first keeps the id, the rest go right above it). Returns ids.
-fn replace_with_pieces(d: &mut Document, id: NodeId, pieces: Vec<PathData>) -> Result<Vec<NodeId>> {
+/// Replace path or compound path `id` with `pieces` (first keeps the id, the rest go right above
+/// it; none removes it). Returns ids.
+pub(super) fn replace_with_pieces(d: &mut Document, id: NodeId, pieces: Vec<PathData>) -> Result<Vec<NodeId>> {
     let mut it = pieces.into_iter();
     let Some(first) = it.next() else {
         d.remove(id)?;
@@ -248,16 +283,16 @@ fn replace_with_pieces(d: &mut Document, id: NodeId, pieces: Vec<PathData>) -> R
         let n = sibling_with(d, id, pd)?;
         ids.push(d.insert(parent, idx + 1 + k, n)?);
     }
-    *path_mut(d, id)? = first;
+    set_geometry(d, id, first)?;
     Ok(ids)
 }
 
-fn ids_json(ids: &[NodeId]) -> Value {
+pub(super) fn ids_json(ids: &[NodeId]) -> Value {
     json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>() })
 }
 
 /// Split a filled path into connected pieces (each outer contour with its holes).
-fn components(pd: &PathData) -> Vec<PathData> {
+pub(super) fn components(pd: &PathData) -> Vec<PathData> {
     let subs: Vec<&SubPath> = pd.subpaths.iter().filter(|s| s.closed && s.anchors.len() >= 2).collect();
     if subs.len() <= 1 {
         return if pd.is_empty() { vec![] } else { vec![pd.clone()] };
@@ -382,7 +417,7 @@ fn cut_subpath(sp: &SubPath, remove: &dyn Fn(Point) -> bool) -> Option<Vec<SubPa
 
 /// Erase from an outline path (open or closed) where `remove` holds. Returns the new geometry per
 /// output object (one object per piece when the path had a single subpath), or None if unchanged.
-fn erase_outline(pd: &PathData, remove: &dyn Fn(Point) -> bool) -> Option<Vec<PathData>> {
+pub(super) fn erase_outline(pd: &PathData, remove: &dyn Fn(Point) -> bool) -> Option<Vec<PathData>> {
     let mut changed = false;
     let mut subs = vec![];
     for sp in &pd.subpaths {
@@ -566,64 +601,60 @@ fn remove_anchor(s: &mut Session, p: &Value) -> Result<Value> {
     let si = p.get("subpath").and_then(Value::as_u64).unwrap_or(0) as usize;
     let ai = usize_req(p, "anchor", C)?;
     let removed = s.edit("Delete Anchor Point", |d, sel| {
-        let path = path_mut(d, id)?;
-        let sp = path.subpaths.get_mut(si).ok_or_else(|| EngineError::Other("no such subpath".into()))?;
-        let n = sp.anchors.len();
-        if ai >= n {
+        let sp = path_mut(d, id)?.subpaths.get(si).ok_or_else(|| EngineError::Other("no such subpath".into()))?;
+        if ai >= sp.anchors.len() {
             return Err(EngineError::Other("no such anchor".into()));
         }
-        let interior = sp.closed || (ai > 0 && ai + 1 < n);
-        if interior && n >= 3 {
-            let (pi, ni) = ((ai + n - 1) % n, (ai + 1) % n);
-            let (prev, a, next) = (sp.anchors[pi], sp.anchors[ai], sp.anchors[ni]);
-            // Keep the outer tangents; stretch them to span both removed segments.
-            let l1 = prev.p.distance(a.p);
-            let l2 = a.p.distance(next.p);
-            let chord = prev.p.distance(next.p).max(1e-9);
-            let first_line = !prev.has_out() && !a.has_in();
-            let second_line = !a.has_out() && !next.has_in();
-            let (mut hout, mut hin) = (prev.h_out, next.h_in);
-            if !(first_line && second_line) {
-                // Curved: stretch the outer handles to span both segments; a straight side aims a
-                // third of the chord at the removed anchor.
-                hout = if prev.has_out() {
-                    prev.p + (prev.h_out - prev.p) * ((l1 + l2) / l1.max(1e-9)).min(3.0)
-                } else {
-                    prev.p + (a.p - prev.p) * (chord / 3.0 / l1.max(1e-9))
-                };
-                hin = if next.has_in() {
-                    next.p + (next.h_in - next.p) * ((l1 + l2) / l2.max(1e-9)).min(3.0)
-                } else {
-                    next.p + (a.p - next.p) * (chord / 3.0 / l2.max(1e-9))
-                };
-            }
-            sp.anchors[pi].h_out = hout;
-            sp.anchors[ni].h_in = hin;
-        }
-        sp.anchors.remove(ai);
-        if !sp.closed && !sp.anchors.is_empty() {
-            let (f, l) = (0, sp.anchors.len() - 1);
-            let a0 = sp.anchors[f].p;
-            sp.anchors[f].h_in = a0;
-            let al = sp.anchors[l].p;
-            sp.anchors[l].h_out = al;
-        }
-        if sp.anchors.len() < 3 {
-            sp.closed = sp.closed && sp.anchors.len() == 2 && sp.anchors.iter().any(|a| a.has_in() || a.has_out());
-        }
-        let empty = sp.anchors.len() < 2;
-        if empty {
-            path.subpaths.remove(si);
-        }
-        if path.is_empty() {
-            d.remove(id)?;
-            sel.clear();
-            return Ok(true);
-        }
-        sel.anchors.remove(&id);
-        Ok(false)
+        remove_anchors_of(d, sel, id, [(si, ai)])
     })?;
     Ok(json!({ "removedObject": removed }))
+}
+
+fn remove_anchors(s: &mut Session, _: &Value) -> Result<Value> {
+    let st = s.doc()?;
+    let jobs: Vec<(NodeId, Vec<(usize, usize)>)> = st
+        .selection
+        .anchors
+        .iter()
+        .filter(|(id, set)| !set.is_empty() && st.doc.node(**id).is_some_and(|n| matches!(n.kind, NodeKind::Path { .. })))
+        .map(|(id, set)| (*id, set.iter().copied().collect()))
+        .collect();
+    if jobs.is_empty() {
+        return Err(bad("path.removeAnchors", "direct-select anchor points of a path"));
+    }
+    let removed = s.edit("Remove Anchor Points", |d, sel| {
+        let mut removed = 0;
+        for (id, anchors) in jobs {
+            removed += usize::from(remove_anchors_of(d, sel, id, anchors)?);
+        }
+        Ok(removed)
+    })?;
+    Ok(json!({ "removedObjects": removed }))
+}
+
+/// Remove `anchors` (subpath, anchor) of path `id` without opening it, refitting the curve round
+/// each one; a subpath left with one anchor goes, and the path with its last subpath. True when
+/// the path went.
+fn remove_anchors_of(d: &mut Document, sel: &mut Selection, id: NodeId, anchors: impl IntoIterator<Item = (usize, usize)>) -> Result<bool> {
+    let mut anchors: Vec<(usize, usize)> = anchors.into_iter().collect();
+    // The last first, so the indexes still to come stay valid.
+    anchors.sort_unstable_by(|a, b| b.cmp(a));
+    anchors.dedup();
+    let path = path_mut(d, id)?;
+    for (si, ai) in anchors {
+        if let Some(sp) = path.subpaths.get_mut(si) {
+            po::remove_anchor(sp, ai);
+        }
+    }
+    path.subpaths.retain(|sp| sp.anchors.len() >= 2);
+    let gone = path.is_empty();
+    if gone {
+        d.remove(id)?;
+        sel.remove(id);
+    } else {
+        sel.anchors.remove(&id);
+    }
+    Ok(gone)
 }
 
 fn convert_anchor(s: &mut Session, p: &Value) -> Result<Value> {
@@ -639,34 +670,13 @@ fn convert_anchor(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Convert Anchor Point", |d, _| {
         let path = path_mut(d, id)?;
         let sp = path.subpaths.get_mut(si).ok_or_else(|| EngineError::Other("no such subpath".into()))?;
-        let n = sp.anchors.len();
-        if ai >= n {
-            return Err(EngineError::Other("no such anchor".into()));
-        }
-        let prev = if ai > 0 || sp.closed { Some(sp.anchors[(ai + n - 1) % n].p) } else { None };
-        let next = if ai + 1 < n || sp.closed { Some(sp.anchors[(ai + 1) % n].p) } else { None };
-        let a = &mut sp.anchors[ai];
-        if !smooth {
-            a.retract();
-            return Ok(());
-        }
+        let a = sp.anchors.get_mut(ai).ok_or_else(|| EngineError::Other("no such anchor".into()))?;
         match target {
-            Some(t) if t.distance(a.p) > 1e-9 => {
-                a.h_out = t;
-                a.h_in = a.p - (t - a.p);
-                a.kind = AnchorKind::Smooth;
-            }
+            _ if !smooth => a.retract(),
+            Some(t) if t.distance(a.p) > 1e-9 => *a = Anchor::smooth(a.p, t),
             Some(_) => a.retract(),
             None => {
-                let (pp, nn) = (prev.unwrap_or(a.p), next.unwrap_or(a.p));
-                let dir = nn - pp;
-                let l = dir.hypot();
-                if l > 1e-9 {
-                    let u = dir / l;
-                    a.h_in = a.p - u * (a.p.distance(pp) / 3.0);
-                    a.h_out = a.p + u * (a.p.distance(nn) / 3.0);
-                    a.kind = AnchorKind::Smooth;
-                }
+                sp.smooth_anchor(ai);
             }
         }
         Ok(())
@@ -691,13 +701,16 @@ fn reshape_segment(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::Other("no such segment".into()));
         }
         let n = sp.anchors.len();
-        // Moving both inner control points by v moves B(t) by 3t(1-t)·v.
+        // Moving both inner control points by v moves B(t) by 3t(1-t)·v. A smooth anchor stays
+        // smooth: its other handle turns with the moved one.
         let v = dv / (3.0 * t * (1.0 - t));
         let (i0, i1) = (seg % n, (seg + 1) % n);
-        let a = sp.anchors[i0];
-        sp.anchors[i0] = Anchor::with_handles(a.p, a.h_in, a.h_out + v);
-        let b = sp.anchors[i1];
-        sp.anchors[i1] = Anchor::with_handles(b.p, b.h_in + v, b.h_out);
+        if let Some(a) = sp.anchors.get_mut(i0) {
+            a.set_handle(true, a.h_out + v, false);
+        }
+        if let Some(b) = sp.anchors.get_mut(i1) {
+            b.set_handle(false, b.h_in + v, false);
+        }
         Ok(())
     })?;
     ok()
@@ -736,30 +749,13 @@ fn split(s: &mut Session, p: &Value) -> Result<Value> {
             }
             _ => return Err(EngineError::Other("no such segment".into())),
         };
+        let mut pieces = sp.cut_at(&std::collections::BTreeSet::from([k]));
         if sp.closed {
-            sp.anchors.rotate_left(k);
-            let mut last = sp.anchors[0];
-            last.h_out = last.p;
-            sp.anchors[0].h_in = sp.anchors[0].p;
-            last.kind = AnchorKind::Corner;
-            sp.anchors[0].kind = AnchorKind::Corner;
-            sp.anchors.push(last);
-            sp.closed = false;
-            path.subpaths[si] = sp;
+            path.subpaths[si] = pieces.pop().ok_or_else(|| EngineError::Other("no such anchor".into()))?;
             sel.set([id]);
             return Ok(vec![id]);
         }
-        let n = sp.anchors.len();
-        if k == 0 || k + 1 >= n {
-            return Err(EngineError::Other("cannot split an open path at its end point".into()));
-        }
-        let mut left = SubPath::new(sp.anchors[..=k].to_vec(), false);
-        let mut right = SubPath::new(sp.anchors[k..].to_vec(), false);
-        let lp = left.anchors[k].p;
-        left.anchors[k].h_out = lp;
-        left.anchors[k].kind = AnchorKind::Corner;
-        right.anchors[0].h_in = lp;
-        right.anchors[0].kind = AnchorKind::Corner;
+        let [left, right] = <[SubPath; 2]>::try_from(pieces).map_err(|_| EngineError::Other("cannot split an open path at its end point".into()))?;
         if path.subpaths.len() == 1 {
             path.subpaths[0] = left;
             let node = sibling_with(d, id, PathData::single(right))?;

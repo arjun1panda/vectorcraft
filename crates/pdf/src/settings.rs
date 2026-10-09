@@ -12,7 +12,7 @@ pub trait Choice: Copy + 'static {
     const ALL: &'static [Self];
     /// The JSON ids, in display order.
     const IDS: &'static [&'static str];
-    /// The labels shown in the Save PDF dialog, in display order.
+    /// The labels shown in the PDF dialogs, in display order.
     const LABELS: &'static [&'static str];
 }
 
@@ -20,19 +20,19 @@ pub trait Choice: Copy + 'static {
 macro_rules! choice {
     ($(#[$m:meta])* $name:ident { $($(#[$vm:meta])* $v:ident = $id:literal, $label:literal;)+ } default $d:ident) => {
         $(#[$m])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
         pub enum $name {
             $($(#[$vm])* #[serde(rename = $id)] $v,)+
         }
 
-        impl Choice for $name {
+        impl $crate::Choice for $name {
             const ALL: &'static [Self] = &[$(Self::$v),+];
             const IDS: &'static [&'static str] = &[$($id),+];
             const LABELS: &'static [&'static str] = &[$($label),+];
         }
 
         impl $name {
-            /// The label shown in the Save PDF dialog.
+            /// The label shown in the PDF dialogs.
             pub fn label(self) -> &'static str {
                 match self {
                     $(Self::$v => $label,)+
@@ -54,6 +54,7 @@ macro_rules! choice {
         }
     };
 }
+pub(crate) use choice;
 
 choice! {
     /// The PDF standard the file conforms to.
@@ -66,29 +67,48 @@ choice! {
         PdfX4 = "pdfX4", "PDF/X-4:2010";
     } default None
 }
-
 impl Standard {
-    /// The writer can produce this standard (PDF/X is not supported yet).
-    pub fn supported(self) -> bool {
-        matches!(self, Self::None | Self::PdfA2b)
+    /// A file of this standard can declare PDF version `c`: PDF/A-2 is based on PDF 1.7 (so it
+    /// can't be PDF 2.0, nor PDF 1.3, which has no transparency), PDF/X-4 on PDF 1.6, and PDF/X-1a
+    /// and PDF/X-3 on PDF 1.3 (PDF 1.4 is accepted too, and written as 1.3).
+    pub fn allows(self, c: Compatibility) -> bool {
+        use Compatibility::*;
+        match self {
+            Self::None => true,
+            Self::PdfA2b => !matches!(c, Pdf13 | Pdf20),
+            Self::PdfX1a | Self::PdfX3 => matches!(c, Pdf13 | Pdf14),
+            Self::PdfX4 => matches!(c, Pdf14 | Pdf15 | Pdf16),
+        }
     }
 
-    /// A file of this standard can declare PDF version `c` (PDF/A-2 is based on PDF 1.7, so it
-    /// can't be PDF 2.0).
-    pub fn allows(self, c: Compatibility) -> bool {
-        !(self == Self::PdfA2b && c == Compatibility::Pdf20)
+    /// The PDF version a file of this standard is (what choosing it sets).
+    pub fn version(self) -> Compatibility {
+        match self {
+            Self::None | Self::PdfA2b => Compatibility::Pdf17,
+            Self::PdfX1a | Self::PdfX3 => Compatibility::Pdf13,
+            Self::PdfX4 => Compatibility::Pdf16,
+        }
     }
 }
 
 choice! {
     /// The PDF version written in the file header.
     Compatibility {
+        /// No transparency: it is flattened (see [`PdfSettings::pdf13`]).
+        Pdf13 = "1.3", "PDF 1.3";
         Pdf14 = "1.4", "PDF 1.4";
         Pdf15 = "1.5", "PDF 1.5";
         Pdf16 = "1.6", "PDF 1.6";
         Pdf17 = "1.7", "PDF 1.7";
         Pdf20 = "2.0", "PDF 2.0";
     } default Pdf17
+}
+
+impl Compatibility {
+    /// The version has PDF layers (optional content, PDF 1.5).
+    pub fn has_layers(self) -> bool {
+        matches!(self, Self::Pdf15 | Self::Pdf16 | Self::Pdf17 | Self::Pdf20)
+    }
 }
 
 choice! {
@@ -206,14 +226,21 @@ pub struct PdfSettings {
     pub fast_web_view: bool,
     /// The app opens the written file (frontends only; the writer ignores it).
     pub view_after_saving: bool,
-    /// Write top-level layers as PDF layers (optional content).
+    /// Write layers and sublayers as PDF layers (optional content).
     pub create_layers: bool,
+    /// Keep the layers whose Print option is off (they are left out otherwise, unless
+    /// `create_layers` is on).
+    pub include_non_printing: bool,
     pub compression: CompressionSettings,
     pub marks: MarkSettings,
     pub bleed: BleedSettings,
     pub output: OutputSettings,
     pub advanced: AdvancedSettings,
     pub security: SecuritySettings,
+    /// The transparency flattener preset PDF 1.3 files (PDF/X-1a and PDF/X-3 ones too) are
+    /// flattened with: a built-in or saved preset's name; empty, High Resolution. The app flattens
+    /// the document before writing; the writer doesn't read it.
+    pub flattener_preset: String,
 }
 
 /// Resampling and compression of one kind of image.
@@ -309,7 +336,8 @@ pub struct BleedSettings {
 }
 
 impl BleedSettings {
-    fn values(&self) -> [f64; 4] {
+    /// `[top, bottom, left, right]`.
+    pub(crate) fn values(&self) -> [f64; 4] {
         [self.top, self.bottom, self.left, self.right]
     }
 }
@@ -337,7 +365,8 @@ pub struct OutputSettings {
 pub struct AdvancedSettings {
     /// Embed whole fonts when more than this share (%) of their characters is used.
     pub font_subset_percent: f64,
-    /// Text as glyph outlines (the only text the writer produces today).
+    /// Text as glyph outlines; off, text is real (selectable, searchable) text in embedded subset
+    /// fonts.
     pub outline_text: bool,
     pub overprint: Overprint,
 }
@@ -381,23 +410,32 @@ impl Default for SecuritySettings {
 }
 
 /// `v` lies in `lo..=hi` (and is a number).
-fn within(name: &str, v: f64, lo: f64, hi: f64, unit: &str) -> Result<(), PdfError> {
+pub(crate) fn within(name: &str, v: f64, lo: f64, hi: f64, unit: &str) -> Result<(), PdfError> {
     if (lo..=hi).contains(&v) { Ok(()) } else { Err(PdfError::BadSetting(format!("{name} must be {lo}–{hi}{unit} (got {v})"))) }
 }
 
 impl PdfSettings {
-    /// Refuse settings the writer can't honour: an unsupported standard, a standard with a PDF
-    /// version it doesn't allow, a password (the file would not be protected) or an out-of-range
-    /// value.
+    /// Refuse settings the writer can't honour: what [`Self::check_values`] refuses, a destination
+    /// profile that isn't there, or a PDF/X output intent it can't write ([`crate::pdfx`]).
     pub fn check(&self) -> Result<(), PdfError> {
-        if !self.standard.supported() {
-            return Err(PdfError::Unsupported(format!("{} output is not supported yet", self.standard.label())));
-        }
+        crate::output::check(self)?;
+        crate::pdfx::check(self)?;
+        self.check_values()
+    }
+
+    /// The part of [`Self::check`] a preset must pass (without the colour settings' profiles): a
+    /// standard with a PDF version it doesn't allow, a standard with editing data, PDF/X-1a or
+    /// PDF/X-3 with PDF layers, or an out-of-range value.
+    pub fn check_values(&self) -> Result<(), PdfError> {
+        self.security.check(self.standard, self.compatibility)?;
         if !self.standard.allows(self.compatibility) {
             return Err(PdfError::BadSetting(format!("{} files can't be {}", self.standard.label(), self.compatibility.label())));
         }
-        if !self.security.open_password.is_empty() || !self.security.permissions_password.is_empty() {
-            return Err(PdfError::Unsupported("password protection is not supported yet (the PDF would not be encrypted)".into()));
+        if self.preserve_editing && self.standard != Standard::None {
+            return Err(PdfError::BadSetting(format!("{} files can't carry editing data: turn off preserveEditing", self.standard.label())));
+        }
+        if self.create_layers && !self.standard.allows_layers() {
+            return Err(PdfError::BadSetting(format!("{} files can't have PDF layers: turn off createLayers", self.standard.label())));
         }
         let c = &self.compression;
         for (name, img) in
@@ -406,54 +444,72 @@ impl PdfSettings {
             within(&format!("compression.{name}.ppi"), img.0, 9.0, 2400.0, " ppi")?;
             within(&format!("compression.{name}.abovePpi"), img.1, 9.0, 2400.0, " ppi")?;
         }
-        within("marks.weight", self.marks.weight, 0.05, 2.0, " pt")?;
-        within("marks.offset", self.marks.offset, 0.0, 72.0, " pt")?;
-        for (side, v) in ["top", "bottom", "left", "right"].iter().zip(self.bleed.values()) {
-            within(&format!("bleed.{side}"), v, 0.0, 72.0, " pt")?;
-        }
+        self.marks.check()?;
+        self.bleed.check()?;
         within("advanced.fontSubsetPercent", self.advanced.font_subset_percent, 0.0, 100.0, "%")
+    }
+
+    /// Layers and sublayers are written as PDF layers: asked for, at a version that has them.
+    pub fn writes_layers(&self) -> bool {
+        self.create_layers && self.compatibility.has_layers()
+    }
+
+    /// The file is PDF 1.3 (asked for, or a PDF/X-1a or PDF/X-3 file): it has no transparency (the
+    /// app flattens it, see [`Self::flattener_preset`]), is written with the PDF 1.4 settings, and
+    /// its header and metadata say 1.3.
+    pub fn pdf13(&self) -> bool {
+        self.compatibility == Compatibility::Pdf13 || self.standard.flattens()
+    }
+
+    /// Forget the passwords (presets never store them).
+    pub fn clear_passwords(&mut self) {
+        self.security.open_password.clear();
+        self.security.permissions_password.clear();
     }
 
     /// Options that are accepted but not applied by the writer yet, one warning each.
     pub fn warnings(&self) -> Vec<String> {
         let d = Self::default();
-        let c = &self.compression;
-        let o = &self.output;
         let s = &self.security;
         [
-            (self.preserve_editing, "Preserve editing is not written yet: the PDF reopens as plain artwork"),
-            (self.thumbnails, "page thumbnails are not embedded yet"),
-            (self.fast_web_view, "fast web view (a linearised file) is not written yet"),
-            (self.create_layers, "PDF layers are not written yet: every layer is plain page content"),
+            (self.create_layers && !self.compatibility.has_layers(), "PDF layers need PDF 1.5 or later: every layer is plain page content"),
             (
-                c.color != d.compression.color || c.gray != d.compression.gray || c.mono != d.compression.mono,
-                "image downsampling and compression settings are not applied yet: images are embedded unchanged",
+                !self.advanced.outline_text && self.advanced.font_subset_percent < 100.0,
+                "fonts are embedded as subsets of the characters used: a subset threshold below 100% is not applied",
             ),
-            (self.marks.any(), "printer's marks are not drawn yet"),
-            (!self.bleed.use_document && self.bleed.values().iter().any(|v| *v > 0.0), "bleed is not added yet: each page is its artboard"),
-            (o.conversion != ColorConversion::None, "colour conversion is not applied yet: colours are written as they are"),
-            (o.profiles != ProfileInclusion::None, "ICC profiles are not embedded yet"),
             (
-                !o.output_intent.is_empty()
-                    || !o.output_condition.is_empty()
-                    || !o.output_condition_id.is_empty()
-                    || !o.registry.is_empty()
-                    || o.trapped,
-                "output intent and trapped entries are not written yet",
-            ),
-            (!self.advanced.outline_text, "text is exported as outlines: real, selectable text is not written yet"),
-            (
-                s.printing != d.security.printing
-                    || s.changes != d.security.changes
-                    || s.copy != d.security.copy
-                    || s.screen_reader != d.security.screen_reader
-                    || s.plaintext_metadata != d.security.plaintext_metadata,
-                "permissions need a permissions password, which is not supported yet: they are not applied",
+                !s.protected()
+                    && (s.printing != d.security.printing
+                        || s.changes != d.security.changes
+                        || s.copy != d.security.copy
+                        || s.screen_reader != d.security.screen_reader
+                        || s.plaintext_metadata != d.security.plaintext_metadata),
+                "permissions need a password: without one they are not applied",
             ),
         ]
         .into_iter()
         .filter(|(on, _)| *on)
         .map(|(_, w)| w.to_string())
+        .chain(crate::encrypt::warnings(self))
+        .chain(crate::output::warnings(self))
         .collect()
+    }
+}
+
+impl MarkSettings {
+    /// Refuse a weight or offset out of range (PDF export and print).
+    pub(crate) fn check(&self) -> Result<(), PdfError> {
+        within("marks.weight", self.weight, 0.05, 2.0, " pt")?;
+        within("marks.offset", self.offset, 0.0, 72.0, " pt")
+    }
+}
+
+impl BleedSettings {
+    /// Refuse a side out of range (PDF export and print).
+    pub(crate) fn check(&self) -> Result<(), PdfError> {
+        for (side, v) in ["top", "bottom", "left", "right"].iter().zip(self.values()) {
+            within(&format!("bleed.{side}"), v, 0.0, 72.0, " pt")?;
+        }
+        Ok(())
     }
 }

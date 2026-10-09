@@ -68,6 +68,9 @@ pub const TOOL_GROUPS: &[&[ToolInfo]] = &[
         t("eraser", "Eraser Tool", Some("Shift+E"), "tool-eraser"),
         t("scissors", "Scissors Tool", Some("C"), "tool-scissors"),
         t("knife", "Knife", None, "tool-knife"),
+        t("mirrorCut", "Mirror & Cut Tool", None, "tool-mirror-cut"),
+        t("lineCut", "Line Cut Tool", None, "tool-line-cut"),
+        t("rectCut", "Rectangle Cut Tool", None, "tool-rect-cut"),
     ],
     &[t("rotate", "Rotate Tool", Some("R"), "tool-rotate"), t("reflect", "Reflect Tool", Some("O"), "tool-reflect")],
     &[
@@ -151,6 +154,17 @@ pub fn group_of(id: &str) -> Option<usize> {
     TOOL_GROUPS.iter().position(|g| g.iter().any(|t| t.id == id))
 }
 
+/// Selection, Direct Selection and Group Selection: the tools Cmd held lends the others for a drag.
+pub fn is_selection_tool(id: &str) -> bool {
+    matches!(id, "selection" | "directSelection" | "groupSelection")
+}
+
+/// The tools that show a selected path's anchors and handles as Direct Selection does, and drag
+/// them: a Cmd drag with one of them is a Direct Selection drag until a selection tool is chosen.
+pub fn edits_anchors(id: &str) -> bool {
+    matches!(id, "directSelection" | "pen" | "addAnchor" | "deleteAnchor" | "anchorPoint" | "curvature")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +189,7 @@ mod tests {
         assert_eq!(tool_for_shortcut("V").unwrap().id, "selection");
         assert_eq!(tool_for_shortcut("Shift+M").unwrap().id, "shapeBuilder");
         assert_eq!(group_of("star"), group_of("rectangle"));
+        assert!(is_selection_tool("groupSelection") && !is_selection_tool("pen"));
+        assert!(edits_anchors("pen") && !edits_anchors("rectangle"));
     }
 }

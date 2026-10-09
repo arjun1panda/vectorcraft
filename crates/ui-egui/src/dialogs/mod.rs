@@ -9,35 +9,76 @@
 mod about;
 mod all_tools;
 mod artboard_options;
+pub mod blend_options;
 pub mod color_balance;
 pub mod color_guide_options;
 mod color_picker;
 mod command;
 pub mod confirm;
+pub mod corners;
 mod document_setup;
+pub mod dxf_import;
+pub mod dxf_options;
+pub mod edit_selection;
 mod effect;
+pub mod envelope;
+pub mod eps_options;
 pub mod expand;
+mod export_as;
 mod export_for_screens;
 pub mod eyedropper;
+pub mod file_info;
 pub mod flatten;
 pub mod flattener_presets;
 mod form;
+pub mod freehand;
 mod gradient_stop;
 pub mod graphic_style_options;
+pub mod halftone;
+pub mod import_pdf;
+pub mod layer_options;
+pub mod layers_panel_options;
+pub mod liquify;
+pub mod missing_links;
+pub(crate) mod modal;
 pub mod new_color_group;
 mod new_document;
 pub mod new_swatch;
+pub mod office_export;
+pub mod package;
 mod path_ops;
+pub mod pdf_presets;
+pub mod perspective_grid;
+pub mod perspective_options;
+pub mod perspective_plane;
+pub mod perspective_presets;
+pub mod place;
+pub mod placement_options;
+pub mod plugin;
+mod png_options;
+pub mod print;
+pub mod print_presets;
+mod psd_options;
+pub mod raster_effects;
+pub mod rearrange_artboards;
 pub mod recolor;
+mod recovery;
 pub mod saturate;
 mod save_changes;
+pub mod save_for_web;
+pub(crate) mod save_options;
 mod save_pdf;
 pub mod save_style_library;
 pub mod save_swatch_library;
 mod shapes;
+pub mod slices;
 pub mod spot_colors;
 pub(crate) mod svg_options;
+pub mod swatch_conflict;
 pub mod swatch_options;
+mod text_export;
+pub mod text_import;
+mod tiff_bmp_tga;
 pub mod tile_edge_color;
 mod tools;
 mod transform;
@@ -47,23 +88,35 @@ pub mod width_point;
 use serde_json::{Value, json};
 
 pub use color_picker::open as open_color_picker;
+pub use document_setup::open as open_document_setup;
 pub use effect::open as open_effect_dialog;
-pub use new_document::open as open_new_document;
-pub use save_pdf::open as open_save_pdf;
+pub use export_as::open as open_export_as;
+pub use export_for_screens::open as open_export_for_screens;
+pub(crate) use export_for_screens::{
+    KIND as EXPORT_FOR_SCREENS, formats as screen_formats, open_assets as open_export_for_screens_assets, saved_rows as screen_saved_rows,
+};
+pub(crate) use new_document::preset_name;
+pub use new_document::{open as open_new_document, preset_card};
+pub use png_options::open as open_raster_options;
+pub use save_pdf::{open as open_save_pdf, open_preset as open_pdf_preset};
 pub use tools::open_tool_dialog;
 
 use crate::state::Dialog;
-use crate::theme::{self, Tokens};
 use crate::{VectorcraftApp, widgets};
 
 type DialogResult = Result<Value, String>;
+
+/// The shared dialog frame's inner margin, and the least room it leaves at the window's edges.
+const MARGIN: i8 = 22;
+const EDGE_GAP: f32 = 8.0;
 
 /// How a dialog draws and applies itself. Specs start from [`DialogSpec::FORM`] and override what
 /// differs.
 pub(crate) struct DialogSpec {
     /// Draws its own window instead of the shared frame (the frame fields below are then unused).
     pub window: Option<fn(&mut VectorcraftApp, &egui::Context)>,
-    /// The heading (and window title).
+    /// The heading (and window title), in the UI language: the spec translates its own text and
+    /// leaves names in it (a document's, a plug-in's) as they are.
     pub heading: fn(&Dialog) -> String,
     /// Draws the fields. Returns true to close the dialog as Cancel would.
     pub body: fn(&mut VectorcraftApp, &mut egui::Ui, &mut Dialog) -> bool,
@@ -77,13 +130,16 @@ pub(crate) struct DialogSpec {
     pub max_width: Option<f32>,
     /// The body runs a live preview interaction that Cancel rolls back.
     pub preview: bool,
+    /// The OK button's label when it depends on the app (Export for Screens' "Download" on the
+    /// web); `ok` when none. Only with an `ok`.
+    pub ok_label: Option<fn(&VectorcraftApp) -> &'static str>,
 }
 
 impl DialogSpec {
     /// A text field per value; OK just closes. Also the fallback for unregistered kinds.
     pub const FORM: Self = Self {
         window: None,
-        heading: |_| "Dialog".into(),
+        heading: |_| tl!("Dialog").into(),
         body: |app, ui, d| {
             form::grid(ui, d, app.session.general_unit());
             false
@@ -97,6 +153,7 @@ impl DialogSpec {
         min_width: 320.0,
         max_width: None,
         preview: false,
+        ok_label: None,
     };
 
     /// A dialog that draws its own window and confirms through its module.
@@ -124,6 +181,9 @@ macro_rules! registry {
                 }
             }
 
+            /// Every variant, in registry order.
+            pub const ALL: &[DialogKind] = &[$(Self::$variant,)+];
+
             fn spec(self) -> &'static DialogSpec {
                 match self {
                     $(Self::$variant => {
@@ -137,7 +197,7 @@ macro_rules! registry {
 }
 
 registry! {
-    NewDocument: ["newDocument"] => new_document::SPEC,
+    NewDocument: [new_document::KIND] => new_document::SPEC,
     Shape: ["rectangle", "roundedRectangle", "ellipse", "polygon", "star", "lineSegment"] => shapes::SPEC,
     Transform: ["move", "rotate", "scale", "reflect", "shear"] => transform::SPEC,
     PathOp: ["average", "offsetPath", "simplify", "splitIntoGrid"] => path_ops::SPEC,
@@ -174,8 +234,65 @@ registry! {
     SpotColors: [spot_colors::KIND] => spot_colors::SPEC,
     TransformEach: [transform_each::KIND] => transform_each::SPEC,
     WidthPoint: [width_point::KIND] => width_point::SPEC,
+    Corners: [corners::KIND] => corners::SPEC,
     SavePdf: [save_pdf::KIND] => save_pdf::SPEC,
     SvgOptions: [svg_options::KIND] => svg_options::SPEC,
+    NewDocumentMore: [new_document::MORE] => new_document::MORE_SPEC,
+    Place: [place::KIND] => place::SPEC,
+    RasterOptions: ["pngOptions", "jpgOptions", "webpOptions", "gifOptions", "png8Options"] => png_options::SPEC,
+    ExportAs: ["exportAs"] => export_as::SPEC,
+    ImportPdf: [import_pdf::KIND] => import_pdf::SPEC,
+    SwatchConflict: [swatch_conflict::KIND] => swatch_conflict::SPEC,
+    FileInfo: [file_info::KIND] => file_info::SPEC,
+    RasterEffectsSettings: [raster_effects::KIND] => raster_effects::SPEC,
+    MissingLinks: [missing_links::KIND] => missing_links::SPEC,
+    TextImport: [text_import::KIND] => text_import::SPEC,
+    PdfPresets: [pdf_presets::KIND] => pdf_presets::SPEC,
+    PdfPreset: [save_pdf::PRESET_KIND] => save_pdf::PRESET_SPEC,
+    SaveOptions: [save_options::KIND] => save_options::SPEC,
+    TextExport: [text_export::KIND] => text_export::SPEC,
+    OfficeExport: [office_export::KIND] => office_export::SPEC,
+    DxfOptions: [dxf_options::KIND] => dxf_options::SPEC,
+    PlacementOptions: [placement_options::KIND] => placement_options::SPEC,
+    Package: [package::KIND] => package::SPEC,
+    SliceOptions: [slices::OPTIONS] => slices::OPTIONS_SPEC,
+    DivideSlices: [slices::DIVIDE] => slices::DIVIDE_SPEC,
+    EpsOptions: [eps_options::KIND] => eps_options::SPEC,
+    Recovery: [crate::recovery::KIND] => recovery::SPEC,
+    DxfImport: [dxf_import::KIND] => dxf_import::SPEC,
+    RasterFormatOptions: ["tiffOptions", "bmpOptions", "tgaOptions"] => png_options::SPEC,
+    SaveForWeb: [save_for_web::KIND] => save_for_web::SPEC,
+    PsdOptions: ["psdOptions"] => png_options::SPEC,
+    Print: [print::KIND] => print::SPEC,
+    PrintPreset: [print::PRESET_KIND] => print::PRESET_SPEC,
+    PrintPresets: [print_presets::KIND] => print_presets::SPEC,
+    Plugin: [plugin::KIND] => plugin::SPEC,
+    VectorHalftone: [halftone::KIND] => halftone::SPEC,
+    PerspectiveGrid: [perspective_grid::KIND] => perspective_grid::SPEC,
+    Envelope: [envelope::WARP, envelope::MESH, envelope::OPTIONS] => envelope::SPEC,
+    LiquifyOptions: [liquify::KIND] => liquify::SPEC,
+    FreehandOptions: [freehand::KIND] => freehand::SPEC,
+    PerspectiveGridPresets: [perspective_presets::KIND] => perspective_presets::SPEC,
+    PerspectiveGridOptions: [perspective_options::KIND] => perspective_options::SPEC,
+    BlendOptions: [blend_options::KIND] => blend_options::SPEC,
+    EditSelection: [edit_selection::KIND] => edit_selection::SPEC,
+    PerspectivePlane: [perspective_plane::KIND] => perspective_plane::SPEC,
+    LayerOptions: [layer_options::KIND] => layer_options::SPEC,
+    LayersPanelOptions: [layers_panel_options::KIND] => layers_panel_options::SPEC,
+    RearrangeArtboards: [rearrange_artboards::KIND] => rearrange_artboards::SPEC,
+}
+
+/// The button labels the shared dialog frame can show (OK, discard and the fixed Cancel/Close),
+/// so the catalog tests can insist they are translated.
+pub fn button_labels() -> Vec<&'static str> {
+    let mut v = vec!["Cancel", "Close"];
+    for spec in std::iter::once(&DialogSpec::FORM).chain(DialogKind::ALL.iter().map(|k| k.spec())) {
+        v.extend(spec.ok);
+        v.extend(spec.discard);
+    }
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// The spec for a `Dialog::kind` ([`DialogSpec::FORM`] when unregistered).
@@ -201,62 +318,76 @@ pub fn cancel(app: &mut VectorcraftApp) {
 /// Apply the open dialog (OK).
 pub fn confirm(app: &mut VectorcraftApp) -> DialogResult {
     let Some(d) = app.ui.dialog.clone() else { return Err("no dialog open".into()) };
-    (spec(&d.kind).confirm)(app, &d)
+    // A file dialog it shows off the UI thread confirms the dialog as it is again.
+    crate::picks::as_entry(app, || crate::picks::Entry::Confirm(Box::new(d.clone())), |app| (spec(&d.kind).confirm)(app, &d))
 }
 
 pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
     about::show(app, ctx);
-    let Some(mut d) = app.ui.dialog.clone() else { return };
+    // The kind of dialog shown last frame: a different one (or none) means this one just opened, and
+    // its first field is to take the keyboard focus (`focus_id`, until a field takes it).
+    let (shown_id, focus_id) = (egui::Id::new("dialog-shown"), egui::Id::new("dialog-focus-pending"));
+    let Some(mut d) = app.ui.dialog.clone() else {
+        app.ui.dialog_file = None;
+        ctx.data_mut(|m| {
+            m.remove::<String>(shown_id);
+            m.remove::<bool>(focus_id);
+        });
+        return;
+    };
+    let focus_first = ctx.data_mut(|m| {
+        if m.get_temp::<String>(shown_id).as_deref() != Some(d.kind.as_str()) {
+            m.insert_temp(shown_id, d.kind.clone());
+            m.insert_temp(focus_id, true);
+        }
+        m.get_temp::<bool>(focus_id).unwrap_or(false)
+    });
     let spec = spec(&d.kind);
     if let Some(window) = spec.window {
         return window(app, ctx);
     }
-    let t = Tokens::get(ctx);
     let mut ok = false;
     let mut cancel = false;
     let mut discard = false;
-    egui::Area::new(egui::Id::new("modal-dim")).order(egui::Order::Middle).fixed_pos(egui::pos2(0.0, 0.0)).show(ctx, |ui| {
-        // Modal, but the canvas isn't dimmed so previews stay readable (as in the reference app).
-        ui.allocate_rect(ctx.content_rect(), egui::Sense::click());
-    });
     let heading = (spec.heading)(&d);
-    egui::Window::new(heading.as_str())
-        // One window per kind, so a dialog never inherits another dialog's size.
-        .id(egui::Id::new(("dialog", d.kind.as_str())))
-        .order(egui::Order::Foreground)
-        .collapsible(false)
-        .resizable(false)
-        .title_bar(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
-        .frame(egui::Frame::window(&ctx.global_style()).fill(t.panel).inner_margin(egui::Margin::same(22)))
-        .show(ctx, |ui| {
-            ui.set_min_width(spec.min_width);
-            if let Some(w) = spec.max_width {
-                ui.set_max_width(w);
+    modal::show(ctx, &heading, egui::Id::new(("dialog", d.kind.as_str())), -40.0, MARGIN, |ui| {
+        // Never wider than the window (a large UI scale in a small window): the text wraps.
+        let room = (ctx.content_rect().width() - 2.0 * (f32::from(MARGIN) + EDGE_GAP)).max(EDGE_GAP);
+        ui.set_min_width(spec.min_width.min(room));
+        ui.set_max_width(spec.max_width.map_or(room, |w| w.min(room)));
+        modal::heading(ui, &heading);
+        ui.add_space(12.0);
+        // Just opened: its first field takes the keyboard focus, as in the reference app (type a
+        // value, press Enter). Only the body's fields can take it.
+        if focus_first {
+            ui.data_mut(|m| m.insert_temp(widgets::dialog_focus_flag(), true));
+        }
+        cancel = (spec.body)(app, ui, &mut d);
+        // Taken (the flag is gone): done. Still there (the window's measuring frame): next frame.
+        if focus_first && ui.data_mut(|m| m.remove_temp::<bool>(widgets::dialog_focus_flag())).is_none() {
+            ui.data_mut(|m| m.remove::<bool>(focus_id));
+        }
+        ui.add_space(16.0);
+        // The button row is as wide as the fields above it and as tall as the buttons: a
+        // right-to-left layout would otherwise take all the room left in the window, so the
+        // window could never shrink to its content.
+        let row = egui::vec2(ui.min_rect().width(), ui.spacing().interact_size.y);
+        ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(label) = spec.ok.map(|ok| spec.ok_label.map_or(ok, |f| f(app)))
+                && widgets::primary_button(ui, label).clicked()
+            {
+                ok = true;
             }
-            ui.label(egui::RichText::new(heading.as_str()).font(theme::semibold(16.0)).color(t.text));
-            ui.add_space(12.0);
-            cancel = (spec.body)(app, ui, &mut d);
-            ui.add_space(16.0);
-            // The button row is as tall as the buttons: a right-to-left layout would otherwise take
-            // all the height left in the window, so the window could never shrink to its content.
-            let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-            ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(label) = spec.ok
-                    && widgets::primary_button(ui, label).clicked()
-                {
-                    ok = true;
-                }
-                ui.add_space(8.0);
-                if widgets::secondary_button(ui, if spec.ok.is_some() { "Cancel" } else { "Close" }).clicked() {
-                    cancel = true;
-                }
-                if let Some(label) = spec.discard {
-                    ui.add_space(28.0);
-                    discard = widgets::secondary_button(ui, label).clicked();
-                }
-            });
+            ui.add_space(8.0);
+            if widgets::secondary_button(ui, if spec.ok.is_some() { "Cancel" } else { "Close" }).clicked() {
+                cancel = true;
+            }
+            if let Some(label) = spec.discard {
+                ui.add_space(28.0);
+                discard = widgets::secondary_button(ui, label).clicked();
+            }
         });
+    });
     if spec.ok.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
         ok = true;
     }
@@ -272,5 +403,75 @@ pub fn show(app: &mut VectorcraftApp, ctx: &egui::Context) {
     }
 }
 
+/// What a dropdown shows for `names`, a list mixing built-in labels (`builtin(index)`: translated
+/// into `lang`) with names the user saved or a file or the system supplied (shown as they are).
+pub(crate) fn shown_names<'a>(lang: crate::i18n::Lang, names: &[&'a str], builtin: impl Fn(usize) -> bool) -> Vec<&'a str> {
+    names.iter().enumerate().map(|(k, n)| crate::i18n::label_or_name(lang, n, builtin(k))).collect()
+}
+
+/// [`widgets::dropdown_names`] over such a mixed list ([`shown_names`] in the UI language), showing
+/// `current` as its entry reads; a `current` that isn't among `names` is shown as given (a caller
+/// translates its own [Custom]). Returns the index chosen in `names`.
+pub(crate) fn mixed_dropdown(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    current: &str,
+    names: &[&str],
+    width: f32,
+    builtin: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let shown = shown_names(crate::i18n::current(), names, builtin);
+    let current = names.iter().position(|n| *n == current).and_then(|i| shown.get(i).copied()).unwrap_or(current);
+    widgets::dropdown_names(ui, id, current, &shown, width)
+}
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_export;
+#[cfg(test)]
+mod tests_import_pdf;
+#[cfg(test)]
+mod tests_package;
+#[cfg(test)]
+mod tests_raster_formats;
+
+#[cfg(test)]
+mod tests_dxf;
+#[cfg(test)]
+mod tests_screen_assets;
+#[cfg(test)]
+mod tests_screens;
+
+#[cfg(test)]
+mod tests_eps;
+
+#[cfg(test)]
+mod tests_metafile;
+
+#[cfg(test)]
+mod tests_tiff_bmp_tga;
+
+#[cfg(test)]
+mod tests_save_for_web;
+
+#[cfg(test)]
+mod tests_psd;
+
+#[cfg(test)]
+mod tests_print;
+
+#[cfg(test)]
+mod tests_print_presets;
+
+#[cfg(test)]
+mod tests_print_advanced;
+
+#[cfg(test)]
+mod tests_scale;
+
+#[cfg(test)]
+mod tests_perspective;
+
+#[cfg(test)]
+mod tests_modal;

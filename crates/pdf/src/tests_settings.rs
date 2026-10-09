@@ -36,7 +36,7 @@ fn json_is_camel_case_and_partial_objects_keep_defaults() {
     assert_eq!(s.compression.gray.downsample, Downsample::Bicubic);
     assert_eq!(s.compression.gray.ppi, 300.0);
     assert!(s.compression.compress_text);
-    for bad in [json!({"compatibility": "1.3"}), json!({"standard": "pdfX9"}), json!({"marks": {"trim": "yes"}})] {
+    for bad in [json!({"compatibility": "1.2"}), json!({"standard": "pdfX9"}), json!({"marks": {"trim": "yes"}})] {
         assert!(serde_json::from_value::<PdfSettings>(bad.clone()).is_err(), "{bad}");
     }
 }
@@ -53,9 +53,13 @@ fn passwords_are_never_serialized() {
 fn checks_refuse_what_the_writer_cant_honour() {
     assert_eq!(PdfSettings::default().check(), Ok(()));
     let refused = |v: serde_json::Value| settings(v).check().unwrap_err();
-    assert!(matches!(refused(json!({"standard": "pdfX4"})), PdfError::Unsupported(_)));
-    assert!(matches!(refused(json!({"security": {"openPassword": "x"}})), PdfError::Unsupported(_)));
-    assert!(matches!(refused(json!({"security": {"permissionsPassword": "x"}})), PdfError::Unsupported(_)));
+    // PDF/X-4 is a PDF 1.6 standard: the default 1.7 is refused.
+    assert!(matches!(refused(json!({"standard": "pdfX4"})), PdfError::BadSetting(m) if m.contains("PDF 1.7")));
+    assert_eq!(settings(json!({"standard": "pdfX4", "compatibility": "1.6"})).check(), Ok(()));
+    // Passwords are written (the file is encrypted); a password with a standard is not.
+    assert_eq!(settings(json!({"security": {"openPassword": "x"}})).check(), Ok(()));
+    assert_eq!(settings(json!({"security": {"permissionsPassword": "x"}})).check(), Ok(()));
+    assert!(matches!(refused(json!({"standard": "pdfA2b", "security": {"openPassword": "x"}})), PdfError::BadSetting(_)));
     assert!(matches!(refused(json!({"compression": {"color": {"ppi": 5}}})), PdfError::BadSetting(m) if m.contains("compression.color.ppi")));
     assert!(matches!(refused(json!({"bleed": {"left": 100}})), PdfError::BadSetting(m) if m.contains("bleed.left")));
     assert!(matches!(refused(json!({"marks": {"weight": 0}})), PdfError::BadSetting(_)));
@@ -65,35 +69,48 @@ fn checks_refuse_what_the_writer_cant_honour() {
     assert_eq!(settings(json!({"standard": "pdfA2b", "compatibility": "1.4"})).check(), Ok(()));
     assert!(Compatibility::ALL.iter().all(|c| Standard::None.allows(*c)));
     assert!(export(&doc(), &PdfOptions { settings: settings(json!({"standard": "pdfX1a"})), ..Default::default() }).is_err());
+    assert!(export(&doc(), &PdfOptions { settings: settings(json!({"standard": "pdfX1a", "compatibility": "1.4"})), ..Default::default() }).is_ok());
 }
 
 #[test]
 fn options_not_applied_yet_come_back_as_warnings() {
     assert!(PdfSettings::default().warnings().is_empty());
     for (v, word) in [
-        (json!({"preserveEditing": true}), "Preserve editing"),
-        (json!({"thumbnails": true}), "thumbnails"),
-        (json!({"fastWebView": true}), "fast web view"),
-        (json!({"createLayers": true}), "layers"),
-        (json!({"compression": {"color": {"compression": "jpeg"}}}), "image"),
-        (json!({"marks": {"registration": true}}), "marks"),
-        (json!({"bleed": {"top": 9}}), "bleed"),
-        (json!({"output": {"conversion": "destination"}}), "conversion"),
-        (json!({"output": {"profiles": "all"}}), "ICC"),
-        (json!({"output": {"trapped": true}}), "trapped"),
-        (json!({"advanced": {"outlineText": false}}), "outlines"),
+        (json!({"createLayers": true, "compatibility": "1.4"}), "PDF 1.5"),
+        (json!({"advanced": {"outlineText": false, "fontSubsetPercent": 35}}), "subset"),
+        (json!({"output": {"outputIntent": "No Such Press"}}), "without embedding"),
+        (json!({"output": {"registry": "http://example.com"}}), "condition identifier"),
+        (json!({"standard": "pdfA2b", "output": {"trapped": true}}), "PDF/A"),
         (json!({"security": {"printing": "low"}}), "permissions"),
     ] {
         let w = settings(v.clone()).warnings();
         assert!(w.len() == 1 && w[0].contains(word), "{v}: {w:?}");
     }
-    // A document bleed, the default view/overprint choices and applied options warn about nothing.
-    for v in [json!({"bleed": {"useDocument": true, "top": 9}}), json!({"viewAfterSaving": true}), json!({"compression": {"compressText": false}})] {
+    // Bleed and marks, the default view/overprint choices and applied options (image compression
+    // too: a codec the writer lacks is reported when an image needs it; colour output; real text)
+    // warn about nothing.
+    for v in [
+        json!({"output": {"conversion": "destination", "destination": vectorcraft_color::cms::GENERIC_CMYK, "profiles": "all"}}),
+        json!({"output": {"conversion": "preserveNumbers", "profiles": "taggedSource"}}),
+        json!({"output": {"outputIntent": vectorcraft_color::cms::GENERIC_CMYK, "outputCondition": "Press", "registry": "r", "trapped": true}}),
+        json!({"output": {"outputConditionId": "CGATS TR 001"}}),
+        json!({"advanced": {"outlineText": false}}),
+        json!({"advanced": {"fontSubsetPercent": 35}}),
+        json!({"bleed": {"useDocument": true, "top": 9}}),
+        json!({"bleed": {"top": 9}, "marks": {"trim": true, "registration": true, "colorBars": true, "pageInfo": true}}),
+        json!({"includeNonPrinting": true}),
+        json!({"createLayers": true}),
+        json!({"viewAfterSaving": true}),
+        json!({"thumbnails": true, "fastWebView": true}),
+        json!({"compression": {"compressText": false}}),
+        json!({"compression": {"color": {"compression": "jpeg"}, "mono": {"compression": "ccittG4"}}}),
+    ] {
         assert!(settings(v.clone()).warnings().is_empty(), "{v}");
     }
     let r =
         export_with_report(&doc(), &PdfOptions { settings: settings(json!({"thumbnails": true, "marks": {"trim": true}})), ..Default::default() })
             .unwrap();
-    assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    // The writer embeds the thumbnails it is given: without them, the one warning says so.
+    assert!(r.warnings.len() == 1 && r.warnings[0].contains("thumbnails need the pages drawn"), "{:?}", r.warnings);
     assert!(r.bytes.starts_with(b"%PDF-1.7"));
 }

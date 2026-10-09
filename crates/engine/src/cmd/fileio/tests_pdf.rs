@@ -60,17 +60,20 @@ fn export_pdf_writes_the_compatibility_header_and_the_range() {
 fn bad_options_are_refused() {
     let mut s = session(2);
     for p in [
-        json!({"compatibility": "1.3"}),
+        json!({"compatibility": "1.2"}),
+        json!({"compatibility": "1.3", "standard": "pdfA2b"}),
+        json!({"compatibility": "1.3", "flattenerPreset": "Nope"}),
         json!({"compatibility": 1.5}),
         json!({"range": "1-3"}),
         json!({"range": "0"}),
         json!({"artboards": []}),
         json!({"preset": "Nope"}),
-        json!({"standard": "pdfX4"}),
+        json!({"standard": "pdfX4", "compatibility": "1.7"}),
         json!({"standard": "pdfA2b", "compatibility": "2.0"}),
         json!({"compression": {"color": {"ppi": 0}}}),
         json!({"compression": "zip"}),
-        json!({"security": {"openPassword": "x"}}),
+        json!({"standard": "pdfA2b", "security": {"openPassword": "x"}}),
+        json!({"security": {"openPassword": "x", "permissionsPassword": "x"}}),
     ] {
         let e = s.execute("document.exportPdf", &p).unwrap_err();
         assert!(matches!(e, crate::EngineError::BadParams { .. }), "{p}: {e}");
@@ -104,19 +107,26 @@ fn pdf_a_refuses_pdf_2() {
 #[test]
 fn options_not_applied_yet_and_document_features_warn() {
     let mut s = session(1);
-    let w = warnings(&export(&mut s, json!({"thumbnails": true, "marks": {"trim": true}})));
-    assert_eq!(w.len(), 2, "{w:?}");
-    assert!(w.iter().any(|w| w.contains("thumbnails")) && w.iter().any(|w| w.contains("marks")));
-    // A pattern stroke is approximated: its warning comes back from every PDF path.
+    // Printer's marks are drawn, thumbnails embedded and the file linearised: nothing to report.
+    let v = export(&mut s, json!({"thumbnails": true, "fastWebView": true, "marks": {"trim": true}}));
+    assert_eq!(warnings(&v), Vec::<String>::new());
+    let text = String::from_utf8_lossy(&b64(&v)).into_owned();
+    assert!(text.contains("/Thumb ") && text.contains("/Linearized 1"));
+    // A pattern stroke is written as its tiles clipped to the stroke: nothing to report.
     let tile = s.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 10, "height": 10})).unwrap()["id"].as_u64().unwrap();
     s.execute("select.set", &json!({"ids": [tile]})).unwrap();
     s.execute("object.pattern.make", &json!({"name": "Dots", "width": 20, "height": 20})).unwrap();
     s.execute("object.pattern.done", &json!({})).unwrap();
     let frame = s.execute("shape.rectangle", &json!({"x": 20, "y": 20, "width": 50, "height": 40})).unwrap()["id"].as_u64().unwrap();
     s.execute("paint.setStroke", &json!({"ids": [frame], "swatch": "Dots"})).unwrap();
-    let pattern = |w: Vec<String>| w.iter().any(|w| w.contains("pattern strokes"));
-    assert!(pattern(warnings(&export(&mut s, json!({})))));
-    assert!(pattern(warnings(&s.execute("document.export", &as_export(&json!({}))).unwrap())));
+    assert_eq!(warnings(&export(&mut s, json!({}))).len(), 0);
+    // A knockout group is approximated: its warning comes back from every PDF path.
+    s.execute("select.set", &json!({"ids": [frame]})).unwrap();
+    s.execute("object.group", &json!({})).unwrap();
+    s.execute("transparency.set", &json!({"knockout": "on"})).unwrap();
+    let knockout = |w: Vec<String>| w.iter().any(|w| w.contains("knockout groups"));
+    assert!(knockout(warnings(&export(&mut s, json!({})))));
+    assert!(knockout(warnings(&s.execute("document.export", &as_export(&json!({}))).unwrap())));
     // Other formats have none.
     assert!(warnings(&s.execute("document.export", &json!({"format": "png"})).unwrap()).is_empty());
 }
@@ -150,7 +160,7 @@ fn pdf_settings_summarise_changes_and_warnings() {
     let changed: Vec<&str> = v["changed"].as_array().unwrap().iter().map(|c| c["option"].as_str().unwrap()).collect();
     assert_eq!(changed, ["compatibility", "compression.compressText", "createLayers", "security.copy"], "key order");
     assert_eq!(v["changed"][0]["value"], "1.5");
-    assert_eq!(v["warnings"].as_array().unwrap().len(), 2, "layers and permissions: {}", v["warnings"]);
+    assert_eq!(v["warnings"].as_array().unwrap().len(), 1, "permissions (PDF layers are written at 1.5): {}", v["warnings"]);
     assert!(!v.to_string().contains("Password"), "passwords never come back");
     assert!(s.execute("document.pdfSettings", &json!({"compatibility": "9"})).is_err());
     // With the document: the in-memory export adds the document's own warnings.
@@ -158,10 +168,13 @@ fn pdf_settings_summarise_changes_and_warnings() {
     s.execute("select.all", &json!({})).unwrap();
     s.execute("object.group", &json!({})).unwrap();
     let g = s.doc().unwrap().selection.objects[0].0;
+    // Raster effects are written as images: nothing to report.
     s.execute("effect.apply", &json!({"effect": "stylize.dropShadow", "ids": [g]})).unwrap();
+    assert_eq!(s.execute("document.pdfSettings", &json!({"includeDocument": true})).unwrap()["warnings"], json!([]));
+    s.execute("transparency.set", &json!({"knockout": "on"})).unwrap();
     assert_eq!(s.execute("document.pdfSettings", &json!({})).unwrap()["warnings"], json!([]));
     let full = s.execute("document.pdfSettings", &json!({"includeDocument": true})).unwrap();
-    assert!(warnings(&full).iter().any(|w| w.contains("group objects")), "{}", full["warnings"]);
+    assert!(warnings(&full).iter().any(|w| w.contains("knockout groups")), "{}", full["warnings"]);
 }
 
 #[test]
