@@ -172,6 +172,9 @@ pub struct TextRun {
     /// CSS weight (400 regular, 700 bold).
     pub weight: i64,
     pub italic: bool,
+    /// Boolean OpenType feature overrides, as tags or `-tag` for disabled features.
+    pub features: Vec<String>,
+    pub all_caps: bool,
     /// Font size in document pixels, before the node's transform.
     pub size: f64,
     /// Tracking in em.
@@ -223,10 +226,16 @@ pub enum Kind {
     /// Layer container (`Scop`).
     Layer,
     Group,
-    /// Artboard: a rectangle that clips its children; `background` paints behind them.
+    /// Artboard: an export rectangle and vector outline that clips its children.
+    /// `background` paints behind them, and `strokes` over them.
     Artboard {
         rect: Rect,
+        /// Actual clipping outline in document pixels. The artboard's export rectangle is its
+        /// bounding box, but a rotated or non-rectangular board still clips to this outline.
+        path: Path,
+        even_odd: bool,
         background: Vec<Paint>,
+        strokes: Vec<Stroke>,
     },
     /// Curve, parametric shape or compound shape: an outline with its fills and strokes.
     /// Children of a shape are clipped by its outline (painted over its fills, under its strokes).
@@ -287,12 +296,23 @@ const MAX_TREE_DEPTH: usize = 128;
 /// Total layer nodes imported.
 const MAX_NODES: usize = 500_000;
 
+/// Pixels decoded from pixel layers over a whole document (2 GB as RGBA). The archive's limits
+/// count the bytes extracted from it, and a layer of one flat colour needs none (#1704).
+const MAX_LAYER_PIXELS: u64 = 512 << 20;
+
 /// Read a document: archive, `doc.dat` and the model.
 pub fn read(bytes: &[u8], limits: Limits) -> Result<Document, Error> {
+    read_within(bytes, limits, MAX_LAYER_PIXELS)
+}
+
+/// [`read`], its pixel layers holding at most `pixels` pixels together.
+pub(crate) fn read_within(bytes: &[u8], limits: Limits, pixels: u64) -> Result<Document, Error> {
     let mut archive = Archive::open(bytes, limits)?;
     let doc = archive.read("doc.dat")?;
     let s = stream::parse(&doc)?;
-    Reader::new(&s, &mut archive).document()
+    let mut reader = Reader::new(&s, &mut archive);
+    reader.pixels_left = pixels;
+    reader.document()
 }
 
 pub(crate) struct Reader<'s, 'a, 'b> {
@@ -302,11 +322,13 @@ pub(crate) struct Reader<'s, 'a, 'b> {
     warnings: BTreeMap<String, usize>,
     nodes: usize,
     active: HashSet<ObjId>,
+    /// Pixels the pixel layers still to come may decode ([`MAX_LAYER_PIXELS`] in all).
+    pub(crate) pixels_left: u64,
 }
 
 impl<'s, 'a, 'b> Reader<'s, 'a, 'b> {
     fn new(s: &'s Stream, archive: &'b mut Archive<'a>) -> Self {
-        Self { s, archive, dpi: 72.0, warnings: BTreeMap::new(), nodes: 0, active: HashSet::new() }
+        Self { s, archive, dpi: 72.0, warnings: BTreeMap::new(), nodes: 0, active: HashSet::new(), pixels_left: MAX_LAYER_PIXELS }
     }
 
     pub(crate) fn warn(&mut self, what: impl Into<String>) {
@@ -436,7 +458,10 @@ impl<'s, 'a, 'b> Reader<'s, 'a, 'b> {
             b"Scop" => Kind::Layer,
             b"Grup" => Kind::Group,
             b"PCrv" | b"ShpN" | b"Comp" | b"SNEN" | b"SNRR" | b"ShRN" => {
-                if class == Tag::of(b"ShpN") && s.bool(id, b"ABEn") == Some(true) {
+                // Affinity 3.2.3's two-board public fixture marks board shapes with an `aprp`
+                // property object in `phrp`, while older documents use `ABEn`. Ordinary shapes
+                // in that fixture have neither. See the pinned corpus and validation audit.
+                if s.bool(id, b"ABEn") == Some(true) || s.obj(id, b"phrp").is_some_and(|p| s.is(p, b"aprp")) {
                     return Ok(self.artboard(id, world));
                 }
                 let Some((local, even_odd)) = crate::geometry::outline(self, id, class, world) else {
@@ -523,12 +548,15 @@ impl<'s, 'a, 'b> Reader<'s, 'a, 'b> {
 
     fn artboard(&mut self, id: ObjId, world: Affine) -> Kind {
         let s = self.s;
-        let b = s.floats::<4>(id, b"ShpB").map(rect).unwrap_or(Rect { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.0 });
+        let Some(b) = s.floats::<4>(id, b"ShpB").map(rect).filter(|b| b.x1 > b.x0 && b.y1 > b.y0) else {
+            self.warn("an artboard without valid bounds (its children are kept without clipping)");
+            return Kind::Unsupported;
+        };
         let corners =
             [Point { x: b.x0, y: b.y0 }, Point { x: b.x1, y: b.y0 }, Point { x: b.x1, y: b.y1 }, Point { x: b.x0, y: b.y1 }].map(|p| world.apply(p));
         let [a, b2, c, d, ..] = world.0;
         if b2.abs() > 1e-9 || c.abs() > 1e-9 || a <= 0.0 || d <= 0.0 {
-            self.warn("a rotated or flipped artboard (imported at its bounding box)");
+            self.warn("a rotated or flipped artboard (export bounds are its bounding box; artwork keeps its outline)");
         }
         let xs = corners.map(|p| p.x);
         let ys = corners.map(|p| p.y);
@@ -538,8 +566,17 @@ impl<'s, 'a, 'b> Reader<'s, 'a, 'b> {
             x1: xs.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             y1: ys.iter().copied().fold(f64::NEG_INFINITY, f64::max),
         };
-        let background = paint::fills(self, id, world, b"BFFl");
-        Kind::Artboard { rect, background }
+        if ![rect.x0, rect.y0, rect.x1, rect.y1].iter().all(|v| v.is_finite()) || rect.x1 <= rect.x0 || rect.y1 <= rect.y0 {
+            self.warn("an artboard with an invalid transformed size (its children are kept without clipping)");
+            return Kind::Unsupported;
+        }
+        let class = s.class(id).unwrap_or(Tag::of(b"ShpN"));
+        let (path, even_odd) = crate::geometry::outline(self, id, class, world).unwrap_or_else(|| {
+            self.warn("an artboard whose outline could not be read (clipped to its rectangle)");
+            (Path { subpaths: vec![crate::shapes::rectangle(b.x0, b.y0, b.x1, b.y1)] }, false)
+        });
+        let (background, strokes) = paint::node_paint(self, id, world);
+        Kind::Artboard { rect, path: path.transformed(world), even_odd, background, strokes }
     }
 }
 

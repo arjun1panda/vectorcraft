@@ -13,12 +13,22 @@ use super::{first_selected, library_panel, pstate, set_pstate, swatches};
 use crate::VectorcraftApp;
 use crate::widgets::{self, menu_item};
 
-const MODES: [(&str, &str); 3] = [("blackAndWhite", "Black and White"), ("grayscale", "Grayscale"), ("color", "Color")];
+const MODES: [(&str, &str); 4] = [("blackAndWhite", "Black and White"), ("grayscale", "Grayscale"), ("color", "Color"), ("logo", "Flat Logo")];
 
 /// Color mode's palettes (`palette` param ids), in panel order.
 const PALETTES: [&str; 4] = ["limited", "fullTone", "automatic", "documentLibrary"];
 
 /// Palette `id`, in the UI language.
+/// The colour Ignore Color leaves out in `params` (`ignoreColor`, `#rrggbb`): white when there is none.
+fn ignore_color(params: &Value) -> [u8; 3] {
+    let hex = params["ignoreColor"].as_str().unwrap_or("").trim_start_matches('#');
+    let channel = |i: usize| hex.get(i * 2..i * 2 + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+    match (hex.len(), channel(0), channel(1), channel(2)) {
+        (6, Some(r), Some(g), Some(b)) => [r, g, b],
+        _ => [255; 3],
+    }
+}
+
 fn palette_label(id: &str) -> &'static str {
     match id {
         "fullTone" => tl!("Full Tone"),
@@ -58,11 +68,12 @@ struct TraceUi {
     synced: Value,
 }
 
-fn presets(app: &mut VectorcraftApp) -> Vec<(String, Value)> {
+/// Each preset: its name, its parameters, and those of its enhanced version (null if it has none).
+fn presets(app: &mut VectorcraftApp) -> Vec<(String, Value, Value)> {
     let v = app.session.execute("imageTrace.presets", &json!({})).unwrap_or_default();
     v["presets"]
         .as_array()
-        .map(|a| a.iter().map(|p| (p["name"].as_str().unwrap_or("").to_string(), p["params"].clone())).collect())
+        .map(|a| a.iter().map(|p| (p["name"].as_str().unwrap_or("").to_string(), p["params"].clone(), p["enhanced"].clone())).collect())
         .unwrap_or_default()
 }
 
@@ -76,7 +87,7 @@ pub(crate) fn is_trace(n: &Node) -> bool {
 /// What the selection is: an Image Trace object (with its stored settings), a plain image, or neither.
 fn target(app: &VectorcraftApp) -> (bool, bool, Option<Value>) {
     let Some(n) = first_selected(app) else { return (false, false, None) };
-    (is_trace(&n), matches!(n.kind, NodeKind::Image(_)), n.trace.map(|t| *t))
+    (is_trace(&n), matches!(n.kind, NodeKind::Image(_)), n.extras().trace.as_deref().cloned())
 }
 
 /// The one selected Image Trace object's preset ("Custom" once its settings were changed) and view.
@@ -84,7 +95,7 @@ pub(crate) fn selected_trace(app: &VectorcraftApp) -> Option<(String, TraceView)
     let st = app.session.active()?;
     let [id] = st.selection.objects[..] else { return None };
     let n = st.doc.node(id).filter(|n| is_trace(n))?;
-    Some((n.trace.as_ref().and_then(|t| t["preset"].as_str()).unwrap_or("Custom").to_string(), n.trace_view()))
+    Some((n.extras().trace.as_ref().and_then(|t| t["preset"].as_str()).unwrap_or("Custom").to_string(), n.trace_view()))
 }
 
 /// Image Trace › View, in the UI language.
@@ -114,7 +125,8 @@ fn set_view(app: &mut VectorcraftApp, view: TraceView) {
 /// The selected Image Trace object's View row (Control bar, Properties).
 pub(crate) fn view_row(app: &mut VectorcraftApp, ui: &mut Ui, current: TraceView, width: f32) {
     widgets::dim_label(ui, tl!("View:"));
-    if let Some(v) = view_dropdown(ui, current, width) {
+    // No wider than what the label leaves of the row (#1358).
+    if let Some(v) = view_dropdown(ui, current, width.min(ui.available_width())) {
         set_view(app, v);
     }
 }
@@ -127,10 +139,16 @@ fn trace_with(app: &mut VectorcraftApp, preset: &str) {
 
 /// The built-in presets to choose from (`current` highlighted) → the one chosen. Listed only
 /// while the menu is open.
+/// A preset's name as shown: translated as a preset's name where the catalog has it so (the
+/// Outline preset is not the Outline view), as any other string else.
+fn preset_label(name: &str) -> &str {
+    crate::i18n::tr_ctx(crate::i18n::current(), "imageTrace", name)
+}
+
 fn preset_list(app: &mut VectorcraftApp, ui: &mut Ui, current: &str) -> Option<String> {
     let mut chosen = None;
-    for (name, _) in presets(app) {
-        if ui.add(egui::Button::selectable(name == current, tl!(&name))).clicked() {
+    for (name, ..) in presets(app) {
+        if ui.add(egui::Button::selectable(name == current, preset_label(&name))).clicked() {
             chosen = Some(name);
         }
     }
@@ -225,6 +243,14 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             retrace = true;
         }
     });
+    // The preset's enhanced version (with Shapes and Auto Grouping) or its legacy one.
+    if let Some((_, legacy, better)) = all.iter().find(|p| p.0 == st.preset && !p.2.is_null()) {
+        let on = *better == st.params;
+        if widgets::check(ui, tl!("Enhanced"), on, true) {
+            st.params = if on { legacy.clone() } else { better.clone() };
+            retrace = true;
+        }
+    }
     ui.horizontal(|ui| {
         widgets::dim_label(ui, tl!("View:"));
         if let Some(v) = view_dropdown(ui, st.view, 170.0) {
@@ -273,6 +299,8 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let (key, label, range, suffix) = match mode.as_str() {
         "blackAndWhite" => ("threshold", tl!("Threshold"), 0.0..=255.0, ""),
         "grayscale" => ("colors", tl!("Grays"), 2.0..=256.0, ""),
+        // Flat Logo finds a handful of flat colours: more than ten is almost always noise.
+        "logo" => ("colors", tl!("Colors"), 2.0..=10.0, ""),
         _ if matches!(palette.as_str(), "fullTone" | "automatic") => ("colorDetail", tl!("Colors"), 0.0..=100.0, "%"),
         _ => ("colors", tl!("Colors"), 2.0..=256.0, ""),
     };
@@ -301,45 +329,82 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             }
             retrace |= release;
         }
-        ui.horizontal(|ui| {
-            widgets::dim_label(ui, tl!("Method:"));
-            for (m, l) in [("abutting", tl!("Abutting")), ("overlapping", tl!("Overlapping"))] {
-                if ui.selectable_label(st.params["method"] == m, l).clicked() && st.params["method"] != m {
-                    st.params["method"] = json!(m);
-                    st.preset = "Custom".into();
-                    retrace = true;
+        // Flat Logo always paints biggest shapes first with a hair of overlap, so there is no choice.
+        if st.params["mode"] != "logo" {
+            ui.horizontal(|ui| {
+                widgets::dim_label(ui, tl!("Method:"));
+                for (m, l) in [("abutting", tl!("Abutting")), ("overlapping", tl!("Overlapping"))] {
+                    if ui.selectable_label(st.params["method"] == m, l).clicked() && st.params["method"] != m {
+                        st.params["method"] = json!(m);
+                        st.preset = "Custom".into();
+                        retrace = true;
+                    }
                 }
-            }
-        });
-        // Create: Fills and/or Strokes (one of them stays on), and the widest line stroked.
-        let create = |p: &Value, key: &str| p[key].as_bool().unwrap_or(key == "fills");
-        let strokes = create(&st.params, "strokes");
-        ui.horizontal(|ui| {
-            widgets::dim_label(ui, tl!("Create:"));
-            for (key, other, label) in [("fills", "strokes", tl!("Fills")), ("strokes", "fills", tl!("Strokes"))] {
-                let on = create(&st.params, key);
-                if widgets::check(ui, label, on, !on || create(&st.params, other)) {
-                    st.params[key] = json!(!on);
-                    st.preset = "Custom".into();
-                    retrace = true;
+            });
+            // Create: Fills and/or Strokes (one of them stays on), and the widest line stroked.
+            let create = |p: &Value, key: &str| p[key].as_bool().unwrap_or(key == "fills");
+            let strokes = create(&st.params, "strokes");
+            ui.horizontal(|ui| {
+                widgets::dim_label(ui, tl!("Create:"));
+                for (key, other, label) in [("fills", "strokes", tl!("Fills")), ("strokes", "fills", tl!("Strokes"))] {
+                    let on = create(&st.params, key);
+                    if widgets::check(ui, label, on, !on || create(&st.params, other)) {
+                        st.params[key] = json!(!on);
+                        st.preset = "Custom".into();
+                        retrace = true;
+                    }
                 }
+            });
+            let mut v = st.params["strokeWidth"].as_f64().unwrap_or(10.0);
+            let (changed, release) = ui.add_enabled_ui(strokes, |ui| slider(ui, tl!("Stroke"), &mut v, 1.0..=100.0, " px")).inner;
+            if changed {
+                st.params["strokeWidth"] = json!(v.round());
+                st.preset = "Custom".into();
             }
-        });
-        let mut v = st.params["strokeWidth"].as_f64().unwrap_or(10.0);
-        let (changed, release) = ui.add_enabled_ui(strokes, |ui| slider(ui, tl!("Stroke"), &mut v, 1.0..=100.0, " px")).inner;
-        if changed {
-            st.params["strokeWidth"] = json!(v.round());
-            st.preset = "Custom".into();
+            retrace |= release;
         }
-        retrace |= release;
-        for (key, label) in [("snapCurvesToLines", tl!("Snap Curves To Lines")), ("ignoreWhite", tl!("Ignore White"))] {
-            let on = st.params[key].as_bool().unwrap_or(false);
-            if widgets::check(ui, label, on, true) {
-                st.params[key] = json!(!on);
+        let snap = st.params["snapCurvesToLines"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Snap Curves To Lines"), snap, true) {
+            st.params["snapCurvesToLines"] = json!(!snap);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        let shapes = st.params["shapes"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Shapes"), shapes, true) {
+            st.params["shapes"] = json!(!shapes);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        let grouping = st.params["autoGrouping"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Auto Grouping"), grouping, true) {
+            st.params["autoGrouping"] = json!(!grouping);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        // (Black and White has one colour and Flat Logo flat ones: no gradients to find.)
+        let gradients = st.params["gradients"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Gradients"), gradients, mode == "grayscale" || mode == "color") {
+            st.params["gradients"] = json!(!gradients);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        // Ignore Color: white, unless another colour is picked.
+        ui.horizontal(|ui| {
+            let on = st.params["ignoreWhite"].as_bool().unwrap_or(false);
+            if widgets::check(ui, tl!("Ignore Color"), on, true) {
+                st.params["ignoreWhite"] = json!(!on);
                 st.preset = "Custom".into();
                 retrace = true;
             }
-        }
+            if on {
+                let mut rgb = ignore_color(&st.params);
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    st.params["ignoreColor"] = json!(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]));
+                    st.preset = "Custom".into();
+                    retrace = true;
+                }
+            }
+        });
     }
     widgets::divider(ui);
     if let Some((p, a, c)) = st.info {
@@ -412,6 +477,31 @@ mod tests {
         app.run("file.place", json!({"name": "half.png", "dataBase64": data, "link": false})).unwrap();
         app.run("imageTrace.make", json!({"preset": "Default"})).unwrap();
         app
+    }
+
+    /// #1358: in Properties the View row fits the panel, so the panel doesn't widen and clip its
+    /// labels (the row took the panel's whole width for its menu, beside its label).
+    #[test]
+    fn the_view_row_fits_the_properties_panel() {
+        let mut app = traced_app();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Where the panel's content ends after a few frames.
+        let right = |app: &mut VectorcraftApp| {
+            let mut right = 0.0;
+            for _ in 0..3 {
+                let screen = Rect::from_min_size(Pos2::ZERO, vec2(280.0, 700.0));
+                let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                    crate::panels::properties::show(app, ui);
+                    right = ui.min_rect().right();
+                });
+                out.textures_delta.clear();
+            }
+            right
+        };
+        let traced = right(&mut app);
+        app.run("select.none", json!({})).unwrap();
+        assert_eq!(traced, right(&mut app));
     }
 
     #[test]

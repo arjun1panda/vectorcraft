@@ -32,6 +32,7 @@ pub(super) fn import(name: &str, bytes: &[u8]) -> Result<Imported> {
         Ok(d) => {
             let mut b = Builder { doc: Document::new(0.0, 0.0), warnings: Vec::new(), k: 72.0 / d.dpi, layer: 0 };
             b.document(&d)?;
+            b.doc.limit_depth_noting(&mut b.warnings);
             let mut warnings = d.warnings.iter().map(|w| format!("Affinity: not imported or approximated: {w}.")).collect::<Vec<_>>();
             warnings.extend(b.warnings.iter().map(|w| format!("Affinity: {w}.")));
             Ok(Imported { doc: b.doc, warnings, preview_only: false })
@@ -206,6 +207,13 @@ impl Builder {
     /// One Affinity node (and its subtree) as VectorCraft art; `to_doc` maps document pixels to
     /// points. `layer_level`: the node is directly in a spread or a layer, so a layer stays a layer.
     fn node(&mut self, n: &af::Node, to_doc: Affine, boards: &mut Vec<(String, Rect)>, layer_level: bool) -> Option<Arc<Node>> {
+        // Register before descending so nested artboards keep their document order.
+        if let Kind::Artboard { rect, .. } = &n.kind {
+            boards.push((
+                if n.name.is_empty() { format!("Artboard {}", boards.len() + 1) } else { n.name.clone() },
+                to_doc.transform_rect_bbox(rect_of(*rect)),
+            ));
+        }
         let child_level = matches!(n.kind, Kind::Layer) && layer_level;
         let children: Vec<Arc<Node>> = n.children.iter().filter_map(|c| self.node(c, to_doc, boards, child_level)).collect();
         let mut out = match &n.kind {
@@ -229,26 +237,30 @@ impl Builder {
                 let appearance = self.appearance(fills, strokes, to_doc);
                 if children.is_empty() {
                     let mut p = self.base(n, NodeKind::Path { path: data, rule, live: None, clipping: false, guide: false });
-                    p.appearance = appearance;
+                    p.appearance = appearance.into();
                     p
                 } else {
                     // A shape clips its children: VectorCraft's clipping path keeps its paint, its
                     // fill behind the clipped art and its stroke over it, as Affinity draws it.
                     let mut clip = Node::new(self.doc.alloc_id(), NodeKind::Path { path: data, rule, live: None, clipping: true, guide: false });
-                    clip.appearance = appearance;
+                    clip.appearance = appearance.into();
                     let mut kids = vec![Arc::new(clip)];
                     kids.extend(children);
                     self.base(n, NodeKind::Group { children: kids, clip: true })
                 }
             }
-            Kind::Artboard { rect, background } => {
-                let r = to_doc.transform_rect_bbox(rect_of(*rect));
-                boards.push((if n.name.is_empty() { format!("Artboard {}", boards.len() + 1) } else { n.name.clone() }, r));
+            Kind::Artboard { path, even_odd, background, strokes, .. } => {
                 let mut clip = Node::new(
                     self.doc.alloc_id(),
-                    NodeKind::Path { path: shapes::rectangle(r), rule: FillRule::NonZero, live: None, clipping: true, guide: false },
+                    NodeKind::Path {
+                        path: self.path(path, to_doc),
+                        rule: if *even_odd { FillRule::EvenOdd } else { FillRule::NonZero },
+                        live: None,
+                        clipping: true,
+                        guide: false,
+                    },
                 );
-                clip.appearance = self.appearance(background, &[], to_doc);
+                clip.appearance = self.appearance(background, strokes, to_doc).into();
                 let mut kids = vec![Arc::new(clip)];
                 kids.extend(children);
                 let mut g = self.base(n, NodeKind::Group { children: kids, clip: true });
@@ -278,7 +290,7 @@ impl Builder {
             // shows outside it, as an opacity mask that clips.
             if let Some(kind) = self.image(img, to_doc) {
                 let art = Node::new(self.doc.alloc_id(), kind);
-                out.mask = Some(Box::new(OpacityMask::new(art, true)));
+                out.extras_mut().mask = Some(Box::new(OpacityMask::new(art, true)));
             }
         }
         if let Some(mask) = &n.mask {
@@ -432,9 +444,27 @@ impl Builder {
             .runs
             .iter()
             .map(|r| {
-                let mut style =
-                    CharStyle { font_family: if r.family.is_empty() { r.postscript.clone() } else { r.family.clone() }, ..CharStyle::default() };
-                style.font_style = font_style(r.weight, r.italic);
+                let mut style = CharStyle::default();
+                if !r.family.is_empty() {
+                    style.font_family = r.family.clone();
+                } else if !r.postscript.is_empty() {
+                    style.font_family = r.postscript.clone();
+                } else {
+                    self.warn("text without a font name uses the default font");
+                }
+                // A family/weight pair cannot identify width variants such as Arial Narrow.
+                // Resolve a known PostScript identity to the exact installed family and style.
+                if let Some((family, face_style)) = vectorcraft_text::FontDb::global().by_postscript_name(&r.postscript) {
+                    style.font_family = family;
+                    style.font_style = face_style;
+                } else {
+                    style.font_style = font_style(r.weight, r.italic);
+                }
+                style.features = r.features.clone();
+                if r.features.iter().any(|feature| !vectorcraft_text::OtFeatures::known_tag(feature)) {
+                    self.warn("unsupported text OpenType features (retained but not rendered)");
+                }
+                style.all_caps = r.all_caps;
                 style.size = r.size * k;
                 style.leading = r.leading.map(|l| l * k);
                 style.tracking = r.tracking * 1000.0;
@@ -459,6 +489,10 @@ impl Builder {
         };
         if let Some(f) = t.frame {
             obj.kind = TextKind::Area { frame: shapes::rectangle(Rect::new(0.0, 0.0, (f.x1 - f.x0) * k, (f.y1 - f.y0) * k)) };
+            // Affinity shows a line in a frame shorter than it (#1423); here none of it would draw.
+            if vectorcraft_text::fit_first_line(vectorcraft_text::FontDb::global(), &mut obj) {
+                self.warn("text frames too short for their first line (made taller so the line shows)");
+            }
         }
         obj
     }
@@ -485,7 +519,7 @@ impl Builder {
         let sy = img.height as f64 / f64::from(r.height.max(1));
         let xf = to_doc * affine(img.transform) * Affine::scale_non_uniform(sx, sy);
         self.doc.images.entry(r.key.clone()).or_insert(r.blob);
-        Some(NodeKind::Image(ImageObject { key: r.key, width: r.width, height: r.height, xf, link: None, placement: Default::default() }))
+        Some(NodeKind::Image(Box::new(ImageObject { key: r.key, width: r.width, height: r.height, xf, link: None, placement: Default::default() })))
     }
 }
 
