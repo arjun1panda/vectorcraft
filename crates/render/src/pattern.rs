@@ -9,7 +9,8 @@
 //! rasterized from (art `Arc` identity, tile, tile type, overlap): the pattern's "revision", and,
 //! when its art shows more than itself (a symbol, another pattern, an image, type, a brush), while
 //! what the document holds of those is what it held then ([`Deps`]), and while the color settings
-//! are the ones it was drawn through.
+//! are the ones it was drawn through. A tile whose art has a plug-in effect, or shows symbols or
+//! patterns, is also dropped when a plug-in is installed or removed.
 //!
 //! Pattern editing mode (`Document::pattern_edit`) draws only the temporary tile layer, with
 //! dimmed copies of it at the neighbouring tile positions and the tile edge.
@@ -88,6 +89,10 @@ struct TileEntry {
     sx: f64,
     sy: f64,
     pixmap: Arc<Pixmap>,
+    /// How many images in the art failed to decode while the tile was drawn
+    /// ([`crate::paint::decode_failures`]): each frame that draws from the tile counts them
+    /// again ([`crate::paint::add_decode_failures`]).
+    failed: u64,
 }
 
 struct PatternCache {
@@ -95,11 +100,30 @@ struct PatternCache {
     tiles: [FrameCache<TileKey, TileEntry>; 4],
     renderer: Option<Box<Renderer>>,
     depth: u32,
+    /// The plug-in revision ([`crate::effects::plugin_revision`]) the tiles were last checked
+    /// against (see [`PatternCache::check_plugins`]).
+    plugin_revision: u64,
 }
 
 impl Default for PatternCache {
     fn default() -> Self {
-        Self { tiles: std::array::from_fn(|_| FrameCache::new(lru::PATTERN_BUDGET, usize::MAX)), renderer: None, depth: 0 }
+        Self { tiles: std::array::from_fn(|_| FrameCache::new(lru::PATTERN_BUDGET, usize::MAX)), renderer: None, depth: 0, plugin_revision: 0 }
+    }
+}
+
+impl PatternCache {
+    /// When a plug-in has been installed or removed since the last check, drop the tiles whose art
+    /// can draw differently with it: art with a plug-in effect, and art that shows symbols or
+    /// patterns ([`crate::fx::Reads::plugins_can_change`]).
+    fn check_plugins(&mut self) {
+        let revision = crate::effects::plugin_revision();
+        if revision == self.plugin_revision {
+            return;
+        }
+        self.plugin_revision = revision;
+        for tiles in &mut self.tiles {
+            tiles.retain(|e| !e.art.iter().any(|a| crate::fx::Reads::of(a).plugins_can_change()));
+        }
     }
 }
 
@@ -141,6 +165,7 @@ fn rasterize(r: &mut Renderer, doc: &Document, def: &PatternDef, region: Rect, w
     let view = Affine::scale_non_uniform(w as f64 / region.width().max(1e-9), h as f64 / region.height().max(1e-9))
         * Affine::translate(-region.origin().to_vec2());
     let opts = RenderOptions::default();
+    r.check_plugins();
     r.check_symbols(doc);
     let symbols = doc.symbol_boxes().quick();
     r.stamp += 1;
@@ -212,6 +237,7 @@ pub(crate) fn set_pattern_paint(ctx: &mut RenderContext, name: &str, xf: Affine,
     let cms = vectorcraft_color::cms::active();
     let hit = CACHE.with(|c| {
         let mut c = c.borrow_mut();
+        c.check_plugins();
         let tiles = &mut c.tiles[ink as usize];
         let t = tiles.tick();
         tiles
@@ -222,25 +248,35 @@ pub(crate) fn set_pattern_paint(ctx: &mut RenderContext, name: &str, xf: Affine,
                     && std::ptr::eq(e.cms.as_ptr(), Arc::as_ptr(&cms))
                     && e.deps.as_ref().is_none_or(|d| d.current(doc))
             })
-            .map(|e| (e.pixmap.clone(), e.sx, e.sy))
+            .map(|e| (e.pixmap.clone(), e.sx, e.sy, e.failed))
     });
     let (pm, sx, sy) = match hit {
-        Some(h) => h,
+        Some((pm, sx, sy, failed)) => {
+            crate::paint::add_decode_failures(failed);
+            (pm, sx, sy)
+        }
         None => {
             let w = (pw * scale).ceil().clamp(1.0, 4096.0) as u16;
             let h = (ph * scale).ceil().clamp(1.0, 4096.0) as u16;
+            let before = crate::paint::decode_failures();
             let Some(pm) = with_tile_renderer(|r| rasterize(r, doc, def, Rect::new(0.0, 0.0, pw, ph), w, h, ink)) else {
                 ctx.set_paint(missing());
                 return true;
             };
+            let failed = crate::paint::decode_failures() - before;
             let pm = Arc::new(pm);
             let (sx, sy) = (w as f64 / pw, h as f64 / ph);
             let deps = crate::fx::Reads::of_all(def.art.iter().map(|a| &**a)).any().then(|| Deps::of(doc));
+            // A cancelled export drew part of the tile: it isn't kept for later frames.
             CACHE.with(|c| {
+                if vectorcraft_doc::cancel::is_cancelled() {
+                    return;
+                }
                 let mut c = c.borrow_mut();
                 let tiles = &mut c.tiles[ink as usize];
                 let (t, bytes) = (tiles.tick(), size_of::<TileEntry>() + w as usize * h as usize * 4);
-                tiles.insert(key, TileEntry { art: def.art.clone(), deps, cms: Arc::downgrade(&cms), params, sx, sy, pixmap: pm.clone() }, bytes, t);
+                let entry = TileEntry { art: def.art.clone(), deps, cms: Arc::downgrade(&cms), params, sx, sy, pixmap: pm.clone(), failed };
+                tiles.insert(key, entry, bytes, t);
             });
             (pm, sx, sy)
         }
@@ -549,6 +585,27 @@ mod tests {
         frame(&mut r, &d, 1.0);
         assert!(tiles_rasterized() > before, "a tile of 100% was dropped");
         assert!(kept().1 <= budget, "{:?}", kept());
+    }
+
+    /// A pattern whose art is an image that can't be decoded: every frame that draws the pattern
+    /// counts the failure ([`crate::paint::decode_failures`]), from a new tile or from the
+    /// tile kept.
+    #[test]
+    fn kept_tiles_count_the_images_they_could_not_decode() {
+        use vectorcraft_doc::{ImageBlob, ImageObject};
+        let mut d = doc_with_pattern(TileType::Grid);
+        // A PNG signature with nothing after it.
+        d.images.insert("cut".into(), ImageBlob::new("image/png", b"\x89PNG\r\n\x1a\n".to_vec()));
+        let im = ImageObject { key: "cut".into(), width: 10, height: 10, xf: Affine::IDENTITY, link: None, placement: Default::default() };
+        d.patterns[0].art = vec![Arc::new(Node::new(NodeId(901), NodeKind::Image(Box::new(im))))];
+        let mut r = Renderer::new();
+        let start = tiles_rasterized();
+        for n in 0..3 {
+            let before = crate::paint::decode_failures();
+            frame(&mut r, &d, 1.0);
+            assert!(crate::paint::decode_failures() > before, "frame {n}");
+        }
+        assert_eq!(tiles_rasterized() - start, 1, "the later frames draw from the tile kept");
     }
 
     #[test]

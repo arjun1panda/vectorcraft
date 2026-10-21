@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use vectorcraft_color::BlendMode;
+use vectorcraft_color::{BlendMode, Color, Paint};
 use vectorcraft_geom::corners::cut_corners;
 use vectorcraft_geom::shapes::{self, CornerKind};
-use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect};
+use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect, Shape};
 
 use crate::appearance::Appearance;
 use crate::live::{BlendSpec, EnvelopeKind, GradientMesh, Outliner};
@@ -102,6 +102,8 @@ pub enum LiveShape {
     },
     Polygon {
         radius: f64,
+        /// 3–1000, as [`LiveShape::set_sides`] gives it; a file's count is clamped when read.
+        #[serde(deserialize_with = "de_sides")]
         sides: u32,
         xf: Affine,
         /// Corner radii in document units, by vertex from the first one clockwise (none: sharp).
@@ -326,6 +328,12 @@ fn all_round(kinds: &[CornerKind]) -> bool {
     kinds.iter().all(|k| *k == CornerKind::Round)
 }
 
+/// A polygon's side count read from a file, clamped as the commands clamp it: the outline and its
+/// corner lists hold one entry per side, so a huge count would allocate gigabytes.
+fn de_sides<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
+    u32::deserialize(d).map(|n| n.clamp(3, 1000))
+}
+
 /// Whether `a` only moves (no rotation, scale, shear or reflection).
 fn moves_only(a: Affine) -> bool {
     let [a0, a1, a2, a3, _, _] = a.as_coeffs();
@@ -486,6 +494,12 @@ pub enum NodeKind {
     /// A placed document: an artboard of another VectorCraft file, linked and locked (see
     /// [`crate::placed_document`]).
     PlacedDocument(Box<crate::placed_document::PlacedDocument>),
+    /// Object › Intertwine: the objects keep their own stacking order, except where one of them
+    /// is drawn over the others: the area [`NodeExtras::intertwine`] of that member (see
+    /// [`crate::intertwine`]).
+    Intertwine {
+        children: Vec<Arc<Node>>,
+    },
 }
 
 fn yes() -> bool {
@@ -543,6 +557,9 @@ pub struct NodeExtras {
     /// Index of the graph series this generated group belongs to. Axes, the legend and other
     /// children leave it unset, so a series named "Legend" or "Axes" is not mistaken for them.
     pub series_index: Option<u32>,
+    /// The group holds the glyph outlines of type. Geometry effects that reshape it move and scale
+    /// the placed gradients in it with the outlines.
+    pub type_outlines: bool,
     /// Editable Shaper composition; the original art is retained in its source child.
     pub shaper: Option<Box<crate::shaper::ShaperSpec>>,
     /// The [`crate::GraphicStyle::id`] last applied to this object. It stays linked while it keeps
@@ -555,6 +572,17 @@ pub struct NodeExtras {
     pub slice: Option<Box<crate::SliceOptions>>,
     /// Object › Perspective: the perspective grid plane the object is attached to.
     pub perspective: Option<Box<crate::PerspectiveAttachment>>,
+    /// Dimension object: the live measurement it draws; its ordinary group children hold its
+    /// exportable appearance (Object › Dimensions, the Dimension tool).
+    pub dimension: Option<Box<crate::dimension::Dimension>>,
+    /// Object › Intertwine: as a member of an Intertwine group, the area (document coordinates,
+    /// filled non-zero) where this object is drawn over the group's other members.
+    pub intertwine: Option<Box<PathData>>,
+    /// Live Paint group: its Gap Options (Object › Live Paint › Gap Options; `None`: the defaults).
+    pub live_paint_gaps: Option<Box<crate::live_paint::GapOptions>>,
+    /// Object › Objects on Path: the group's path and the objects attached to it (see
+    /// [`crate::objects_on_path`]).
+    pub objects_on_path: Option<Box<crate::objects_on_path::ObjectsOnPath>>,
 }
 
 /// No extras: what [`Node::extras`] gives for a node without any.
@@ -564,11 +592,16 @@ static NO_EXTRAS: NodeExtras = NodeExtras {
     wrap: None,
     graph: None,
     series_index: None,
+    type_outlines: false,
     shaper: None,
     graphic_style: None,
     attrs: None,
     slice: None,
     perspective: None,
+    dimension: None,
+    intertwine: None,
+    live_paint_gaps: None,
+    objects_on_path: None,
 };
 
 /// A node's [`NodeExtras`], if it has any ([`Node::extras`]). Extras that are all unset equal
@@ -692,6 +725,7 @@ impl Serialize for Node {
             e.wrap.is_none(),
             e.graph.is_none(),
             e.series_index.is_none(),
+            is_default(&e.type_outlines),
             e.shaper.is_none(),
             false,
             e.graphic_style.is_none(),
@@ -699,6 +733,10 @@ impl Serialize for Node {
             e.slice.is_none(),
             is_default(&self.bbox_angle),
             e.perspective.is_none(),
+            e.dimension.is_none(),
+            e.intertwine.is_none(),
+            e.live_paint_gaps.is_none(),
+            e.objects_on_path.is_none(),
         ];
         let mut st = s.serialize_struct("Node", skips.iter().filter(|s| !**s).count())?;
         let mut skip = skips.into_iter();
@@ -726,6 +764,7 @@ impl Serialize for Node {
         field!("wrap", &e.wrap);
         field!("graph", &e.graph);
         field!("series_index", &e.series_index);
+        field!("type_outlines", &e.type_outlines);
         field!("shaper", &e.shaper);
         field!("kind", &self.kind);
         field!("graphic_style", &e.graphic_style);
@@ -733,6 +772,10 @@ impl Serialize for Node {
         field!("slice", &e.slice);
         field!("bbox_angle", &self.bbox_angle);
         field!("perspective", &e.perspective);
+        field!("dimension", &e.dimension);
+        field!("intertwine", &e.intertwine);
+        field!("live_paint_gaps", &e.live_paint_gaps);
+        field!("objects_on_path", &e.objects_on_path);
         st.end()
     }
 }
@@ -772,6 +815,8 @@ struct NodeWire {
     #[serde(default)]
     series_index: Option<u32>,
     #[serde(default)]
+    type_outlines: bool,
+    #[serde(default)]
     shaper: Option<Box<crate::shaper::ShaperSpec>>,
     kind: NodeKind,
     #[serde(default)]
@@ -784,6 +829,14 @@ struct NodeWire {
     bbox_angle: f64,
     #[serde(default)]
     perspective: Option<Box<crate::PerspectiveAttachment>>,
+    #[serde(default)]
+    dimension: Option<Box<crate::dimension::Dimension>>,
+    #[serde(default)]
+    intertwine: Option<Box<PathData>>,
+    #[serde(default)]
+    live_paint_gaps: Option<Box<crate::live_paint::GapOptions>>,
+    #[serde(default)]
+    objects_on_path: Option<Box<crate::objects_on_path::ObjectsOnPath>>,
 }
 
 impl From<NodeWire> for Node {
@@ -794,11 +847,16 @@ impl From<NodeWire> for Node {
             wrap: w.wrap,
             graph: w.graph,
             series_index: w.series_index,
+            type_outlines: w.type_outlines,
             shaper: w.shaper,
             graphic_style: w.graphic_style,
             attrs: w.attrs,
             slice: w.slice,
             perspective: w.perspective,
+            dimension: w.dimension,
+            intertwine: w.intertwine,
+            live_paint_gaps: w.live_paint_gaps,
+            objects_on_path: w.objects_on_path,
         };
         Node {
             id: w.id,
@@ -843,6 +901,38 @@ impl OpacityMask {
     }
 }
 
+/// Every paint of `n` (and its children) white, opacities kept: an alpha mask's art as an opacity
+/// mask's, whose luminance over the black outside the art is then the art's alpha.
+pub fn whiten(n: &mut Node) {
+    let white = |p: &mut Paint| match p {
+        Paint::Solid { color, swatch, tint } => {
+            (*color, *swatch, *tint) = (Color::WHITE, None, 1.0);
+        }
+        Paint::Gradient(g) => {
+            for s in &mut g.gradient.stops {
+                (s.color, s.swatch, s.tint) = (Color::WHITE, None, 1.0);
+            }
+        }
+        Paint::None | Paint::Pattern { .. } => {}
+    };
+    for item in &mut n.appearance.items {
+        white(item.paint_mut());
+    }
+    match &mut n.kind {
+        NodeKind::Mesh(m) => m.points.iter_mut().for_each(|p| p.color = Color::WHITE),
+        NodeKind::Text(t) => t.runs.iter_mut().for_each(|r| {
+            white(&mut r.style.fill);
+            white(&mut r.style.stroke);
+        }),
+        _ => {}
+    }
+    if let Some(ch) = n.children_mut() {
+        for c in ch {
+            whiten(Arc::make_mut(c));
+        }
+    }
+}
+
 impl Node {
     pub fn new(id: NodeId, kind: NodeKind) -> Self {
         Self {
@@ -884,7 +974,8 @@ impl Node {
             | NodeKind::Compound { children, .. }
             | NodeKind::Blend { children, .. }
             | NodeKind::Envelope { content: children, .. }
-            | NodeKind::Repeat(RepeatSpec { source: children, .. }) => Some(children),
+            | NodeKind::Repeat(RepeatSpec { source: children, .. })
+            | NodeKind::Intertwine { children } => Some(children),
             _ => None,
         }
     }
@@ -895,7 +986,8 @@ impl Node {
             | NodeKind::Compound { children, .. }
             | NodeKind::Blend { children, .. }
             | NodeKind::Envelope { content: children, .. }
-            | NodeKind::Repeat(RepeatSpec { source: children, .. }) => Some(children),
+            | NodeKind::Repeat(RepeatSpec { source: children, .. })
+            | NodeKind::Intertwine { children } => Some(children),
             _ => None,
         }
     }
@@ -950,6 +1042,7 @@ impl Node {
         match &self.kind {
             NodeKind::Layer { .. } => "Layer",
             NodeKind::Group { clip: true, .. } => "Clip Group",
+            NodeKind::Group { .. } if self.extras().objects_on_path.is_some() => "Objects on Path",
             NodeKind::Group { .. } => "Group",
             NodeKind::Path { live: Some(l), .. } => l.label(),
             NodeKind::Path { guide: true, .. } => "Guide",
@@ -963,6 +1056,7 @@ impl Node {
             NodeKind::Mesh(_) => "Mesh",
             NodeKind::Repeat(r) => r.kind.label(),
             NodeKind::PlacedDocument(_) => "Placed Document",
+            NodeKind::Intertwine { .. } => "Intertwine",
         }
     }
     /// Name shown in the Layers panel: explicit name or `<Kind>`.
@@ -1011,8 +1105,10 @@ impl Node {
     }
     /// A quick box round everything the object can paint, for culling clicks: paths and compound
     /// paths grow their geometric bounds by the farthest their strokes can reach from any path
-    /// ([`Appearance::outset`]) instead of measuring along their shape. Symbol instances are
-    /// measured as in [`Node::visual_bounds`].
+    /// ([`Appearance::outset`]) instead of measuring along their shape. An image's box takes in
+    /// the shapes its own fills and strokes paint ([`crate::hit::set_image_paint`]). Groups, layers
+    /// without a clipping mask and Intertwine groups take in their members' boxes, grown by their
+    /// own strokes. Symbol instances are measured as in [`Node::visual_bounds`].
     pub fn reach_bounds(&self) -> Option<Rect> {
         self.reach(None)
     }
@@ -1030,6 +1126,22 @@ impl Node {
                 let o = self.appearance.outset();
                 self.geometric(symbols).map(|b| b.inflate(o, o))
             }
+            // The members' reach, grown by the container's own strokes.
+            NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } => {
+                let o = self.appearance.outset();
+                children
+                    .iter()
+                    .skip(usize::from(self.extras().shaper.is_some()))
+                    .fold(None, |acc, c| vectorcraft_geom::union_opt(acc, c.reach(symbols)))
+                    .map(|b| b.inflate(o, o))
+            }
+            NodeKind::Intertwine { children } => children.iter().fold(None, |acc, c| vectorcraft_geom::union_opt(acc, c.reach(symbols))),
+            // The frame and each shape the image's own fills and strokes paint, a stroke's grown by
+            // the farthest it can reach from its shape.
+            NodeKind::Image(_) => crate::hit::image_paint(self).iter().fold(self.geometric(symbols), |acc, (bp, _, item)| {
+                let o = if let crate::AppearanceItem::Stroke(s) = item { s.reach() } else { 0.0 };
+                vectorcraft_geom::union_opt(acc, (!bp.elements().is_empty()).then(|| bp.bounding_box().inflate(o, o)))
+            }),
             _ => self.visual(symbols),
         }
     }
@@ -1074,12 +1186,14 @@ impl Node {
             // copies out by the source's bounds measured without the document.
             NodeKind::Repeat(r) => r.copies_bounds(union(&r.source)?),
             NodeKind::PlacedDocument(p) => Some(p.bounds()),
+            // The members drawn over the others are drawn where they are.
+            NodeKind::Intertwine { children } => union(children),
         }
     }
     /// Visual bounds: what the object paints, its strokes included (paths and compound paths
-    /// measure theirs along their own shape, see [`Appearance::stroked_bounds`]). A symbol
-    /// instance is measured as in [`Node::geometric_bounds`], grown by its own strokes' reach
-    /// ([`Node::visual_bounds_with`] measures its art).
+    /// measure theirs along their own shape, see [`Appearance::stroked_bounds`]). An image is
+    /// measured by its frame. A symbol instance is measured as in [`Node::geometric_bounds`],
+    /// grown by its own strokes' reach ([`Node::visual_bounds_with`] measures its art).
     pub fn visual_bounds(&self) -> Option<Rect> {
         self.visual(None)
     }
@@ -1108,6 +1222,7 @@ impl Node {
                     clip.geometric(symbols)
                 }
             }
+            NodeKind::Intertwine { children } => children.iter().fold(None, |acc, c| vectorcraft_geom::union_opt(acc, c.visual(symbols))),
             NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } => {
                 // The container's own strokes paint around its members.
                 let o = self.appearance.outset();
@@ -1146,6 +1261,15 @@ impl Node {
                 let o = self.appearance.outset() + symbols.map_or(0.0, |s| s.brush_pad(symbol));
                 self.projected(Some(b)).map(|b| b.inflate(o, o))
             }
+            NodeKind::Text(t) => {
+                // The characters' strokes paint around the glyphs, scaled with the type.
+                let k = Scaling::factor(t.xf).unwrap_or(1.0);
+                let chars = t.runs.iter().map(|r| r.style.stroke_outset()).fold(0.0, f64::max) * k;
+                let o = self.appearance.outset().max(chars);
+                self.geometric(symbols).map(|b| b.inflate(o, o))
+            }
+            // An image is measured by its frame, without its own fills and strokes.
+            NodeKind::Image(_) => self.geometric(symbols),
             _ => {
                 let o = self.appearance.outset();
                 self.geometric(symbols).map(|b| b.inflate(o, o))
@@ -1159,6 +1283,18 @@ impl Node {
         self.transform_scaled(a, &scaling.into());
     }
     fn transform_scaled(&mut self, a: Affine, sc: &Scaling) {
+        // A dimension's measurement moves with it.
+        if let Some(e) = self.extras_if_any()
+            && let Some(dimension) = &mut e.dimension
+        {
+            dimension.transform(a);
+        }
+        // The frames of the objects attached to a path move with them.
+        if let Some(e) = self.extras_if_any()
+            && let Some(on_path) = &mut e.objects_on_path
+        {
+            on_path.transform(a);
+        }
         if !self.is_layer() {
             self.bbox_angle = crate::orient::transformed_angle(self.bbox_angle, a);
         }
@@ -1197,7 +1333,10 @@ impl Node {
                     }
                 }
             }
-            NodeKind::Layer { children, .. } | NodeKind::Group { children, .. } | NodeKind::Compound { children, .. } => {
+            NodeKind::Layer { children, .. }
+            | NodeKind::Group { children, .. }
+            | NodeKind::Compound { children, .. }
+            | NodeKind::Intertwine { children } => {
                 for c in children.iter_mut() {
                     Arc::make_mut(c).transform_scaled(a, sc);
                 }
@@ -1250,6 +1389,10 @@ impl Node {
             && m.linked
         {
             Arc::make_mut(&mut m.art).transform_scaled(a, sc);
+        }
+        // The area where an Intertwine member is drawn over the others moves with it.
+        if let Some(area) = self.extras_if_any().and_then(|e| e.intertwine.as_mut()) {
+            area.transform(a);
         }
     }
     /// Visit this node and all descendants depth first (paint order).
@@ -1379,7 +1522,7 @@ impl Node {
                 let frame = shapes::rectangle(p.natural()).transformed(p.xf);
                 out.push((frame.to_bezpath(), FillRule::NonZero));
             }
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) => {
+            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::Intertwine { .. } => {
                 crate::live::expand_deep(self, text).push_clip_shapes(text, out);
             }
         }
@@ -1584,11 +1727,11 @@ impl Node {
 
 impl Node {
     /// The Appearance panel's row for what this object's own fills and strokes paint around:
-    /// "Contents" for a group or layer (its members), "Characters" for type; `None` for objects
-    /// whose fills and strokes paint their own geometry.
+    /// "Contents" for a group or layer (its members) and for an image (its pixels), "Characters"
+    /// for type; `None` for objects whose fills and strokes paint their own geometry.
     pub fn contents_label(&self) -> Option<&'static str> {
         match self.kind {
-            NodeKind::Group { .. } | NodeKind::Layer { .. } => Some("Contents"),
+            NodeKind::Group { .. } | NodeKind::Layer { .. } | NodeKind::Image(_) => Some("Contents"),
             NodeKind::Text(_) => Some("Characters"),
             _ => None,
         }
@@ -1615,7 +1758,40 @@ pub struct ObjectAttributes {
     /// `("pivot", "100,180")`), kept from import to export (`object.setProps {data}`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data: Vec<(String, String)>,
+    /// Window › SVG Interactivity: the JavaScript each event runs, in the panel's order
+    /// (`("onclick", "alert(1)")`, one entry per event of [`SVG_EVENTS`]). SVG export writes them as
+    /// the element's event attributes; nothing in VectorCraft runs them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<(String, String)>,
 }
+
+/// The events the SVG Interactivity panel attaches JavaScript to, by the names of the SVG event
+/// attributes that run it.
+pub const SVG_EVENTS: [&str; 19] = [
+    "onfocusin",
+    "onfocusout",
+    "onactivate",
+    "onmousedown",
+    "onmouseup",
+    "onclick",
+    "onmouseover",
+    "onmousemove",
+    "onmouseout",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onload",
+    "onerror",
+    "onabort",
+    "onunload",
+    "onzoom",
+    "onresize",
+    "onscroll",
+];
+
+/// The most JavaScript files a document links (`Document::svg_scripts`): SVG import keeps the
+/// first ones and warns about the rest, and `svgInteractivity.addFile` refuses another.
+pub const MAX_SVG_SCRIPTS: usize = 64;
 
 /// The Attributes panel's Image Map shapes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1794,6 +1970,9 @@ mod kind_de {
         Mesh(GradientMesh),
         Repeat(RepeatSpec),
         PlacedDocument(Box<crate::placed_document::PlacedDocument>),
+        Intertwine {
+            children: Vec<Arc<Node>>,
+        },
     }
 
     impl<'de> Deserialize<'de> for NodeKind {
@@ -1923,10 +2102,12 @@ mod tests {
             e.mask = Some(Box::new(OpacityMask::new(Node::group(NodeId(8), vec![]), true)));
             e.trace = Some(Box::new(serde_json::json!({"preset": "p"})));
             e.series_index = Some(2);
+            e.type_outlines = true;
             e.graphic_style = Some(3);
             e.attrs = Some(Box::default());
             e.slice = Some(Box::default());
             e.perspective = Some(Box::new(crate::PerspectiveAttachment::new("left", 1.0)));
+            e.live_paint_gaps = Some(Box::default());
         }
         /// The top-level keys of a JSON object, in the order written.
         struct Keys(Vec<String>);
@@ -1961,12 +2142,14 @@ mod tests {
             "mask",
             "trace",
             "series_index",
+            "type_outlines",
             "kind",
             "graphic_style",
             "attrs",
             "slice",
             "bbox_angle",
             "perspective",
+            "live_paint_gaps",
         ];
         assert_eq!(keys, order);
         assert_eq!(serde_json::from_value::<Node>(v).unwrap(), n);
@@ -2013,6 +2196,24 @@ mod tests {
         assert_eq!((json["shape"].as_str(), json.get("kinds")), (Some("path"), None));
         assert_eq!(serde_json::from_value::<LiveShape>(json).unwrap(), path);
         assert_eq!(path.label(), "Path");
+    }
+
+    /// A polygon read from a file has 3 to 1000 sides, as the commands give it: selecting one
+    /// with four billion made its outline and corner lists allocate tens of gigabytes.
+    #[test]
+    fn a_polygon_from_a_file_has_3_to_1000_sides() {
+        let read = |sides: u32| {
+            let json = serde_json::json!({"shape": "polygon", "radius": 10.0, "sides": sides, "xf": [1, 0, 0, 1, 0, 0]});
+            serde_json::from_value::<LiveShape>(json).unwrap()
+        };
+        let sides_of = |l: &LiveShape| match l {
+            LiveShape::Polygon { sides, .. } => *sides,
+            _ => panic!("not a polygon: {l:?}"),
+        };
+        let huge = read(4_000_000_000);
+        assert_eq!([0, 5, 1000].map(|n| sides_of(&read(n))), [3, 5, 1000]);
+        assert_eq!(sides_of(&huge), 1000);
+        assert_eq!(huge.polygon_outline().anchor_count(), 1000);
     }
 
     #[test]
@@ -2245,6 +2446,25 @@ mod tests {
         let mut p = Node::path(NodeId(2), shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 10.0)), Appearance::default_art());
         p.appearance.stroke_mut().unwrap().join = crate::appearance::LineJoin::Round;
         assert_eq!(p.visual_bounds(), Some(Rect::new(-0.5, -0.5, 10.5, 10.5)));
+    }
+
+    /// Type's visual bounds grow by how far its character strokes paint past the glyphs: half the
+    /// weight centred, the whole weight outside, nothing inside; scaled with the type.
+    #[test]
+    fn type_visual_bounds_grow_with_the_character_stroke() {
+        use crate::appearance::StrokeAlign;
+        use crate::text::{CharStyle, TextObject};
+        let style = CharStyle { stroke: vectorcraft_color::Paint::solid(vectorcraft_color::Color::BLACK), stroke_width: 4.0, ..Default::default() };
+        let mut t = TextObject::point(vectorcraft_geom::Point::new(0.0, 0.0), "Ab", style);
+        t.xf = Affine::scale(2.0) * t.xf;
+        let node = |t: &TextObject| Node::new(NodeId(1), NodeKind::Text(Box::new(t.clone())));
+        let g = node(&t).geometric_bounds().unwrap();
+        for (align, grow) in [(StrokeAlign::Center, 4.0), (StrokeAlign::Outside, 8.0), (StrokeAlign::Inside, 0.0)] {
+            t.runs[0].style.stroke_align = align;
+            assert_eq!(node(&t).visual_bounds(), Some(g.inflate(grow, grow)), "{align:?}");
+        }
+        t.runs[0].style.stroke = vectorcraft_color::Paint::None;
+        assert_eq!(node(&t).visual_bounds(), Some(g), "no stroke, no growth");
     }
 
     /// A group holding a path, a compound, an image and a nested group, as a file writes it.

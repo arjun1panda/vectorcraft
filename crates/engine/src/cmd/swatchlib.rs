@@ -272,7 +272,14 @@ impl<L: LibraryFile> Libraries<L> {
             .map(|e| (e.path.clone(), e.lib.clone()))
             .ok_or_else(|| bad(cmd, format!("`{id}` isn't a loaded library")))?;
         let (file, bytes) = match source.filter(|p| L::EXTS.contains(&extension(p).as_str())) {
-            Some(p) => (file_name(&p), read_file(&p)?),
+            Some(p) => {
+                let ext = extension(&p);
+                let base = file_name(&p);
+                // Color books (.acb) name the tab from the book title inside the file; a sandbox
+                // copy of an import often lands as tmp….tmp.acb (#2996).
+                let file = if ext == "acb" || temporary_library_file_name(&base) { library_file_name(lib.name(), &ext) } else { base };
+                (file, read_file(&p)?)
+            }
             None => (library_file_name(lib.name(), ext), encode(&lib)?),
         };
         self.rescan();
@@ -300,6 +307,12 @@ impl<L: LibraryFile> Libraries<L> {
         self.copied.push((id.to_string(), info.id.clone()));
         Ok((info, lib, written.is_some()))
     }
+}
+
+/// A library file name that looks like a host temporary (e.g. macOS `tmp1F2C.tmp.acb`).
+fn temporary_library_file_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains(".tmp.")
 }
 
 /// The file name of library `name` with extension `ext`: characters file systems reject become
@@ -391,6 +404,17 @@ pub fn library_colors(s: &Session, key: &str) -> Option<Vec<Color>> {
         return Some(s.active()?.doc.swatches_iter().filter_map(colors).collect());
     }
     Some(library(s, key)?.1.iter().filter_map(colors).collect())
+}
+
+/// The colour swatches of library `key` (an id or name) or, for [`DOCUMENT_SWATCHES`], of the
+/// active document (tint swatches left out: they stand for their base). `None` when there is no
+/// such library (or document).
+pub fn library_swatches(s: &Session, key: &str) -> Option<Vec<Swatch>> {
+    let own = |sw: &&Swatch| matches!(sw.paint, Paint::Solid { swatch: None, .. });
+    if key == DOCUMENT_SWATCHES {
+        return Some(s.active()?.doc.swatches_iter().filter(own).cloned().collect());
+    }
+    Some(library(s, key)?.1.iter().filter(own).cloned().collect())
 }
 
 /// The `limitTo` parameter's palette ([`limit_palette`]); `None` without one (or for "").

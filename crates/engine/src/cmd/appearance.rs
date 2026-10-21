@@ -15,14 +15,16 @@
 //! layer's own fills and strokes paint its members' geometry and its effects apply to them as one
 //! piece; the Contents row (type: Characters) is the slot that says which of its fills and strokes
 //! paint below the members and which above ([`Appearance::contents_at`], moved by
-//! `appearance.moveItem {from: "contents"}`).
+//! `appearance.moveItem {from: "contents"}`). An image's own fills and strokes paint only the
+//! shape that a Convert to Shape or Outline Object effect on them gives them, below or above the
+//! image as its Contents row says; new ones go right below that row.
 
 use serde_json::{Value, json};
 use vectorcraft_color::{BlendMode, Paint};
 use vectorcraft_doc::{Appearance, AppearanceItem, CharStyle, FillLayer, Node, NodeKind, ParaStyle, StrokeLayer};
 use vectorcraft_geom::Rect;
 
-use super::edit::selected_roots;
+use super::edit::{outermost, selected_roots};
 use super::opacitymask::percent;
 use super::paint::paint_from;
 use super::*;
@@ -36,7 +38,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add New Fill",
             ["Window", "Appearance"],
             None,
-            "{ids?|id?, target?: \"object\"|\"contents\"} add a fill on top of each selected object's own stack (a copy of its top fill; type without one: its characters' fill; else the default fill)",
+            "{ids?|id?, target?: \"object\"|\"contents\"} add a fill on top of each selected object's own stack, on an image right below its Contents row (a copy of its top fill; type without one: its characters' fill; else the default fill)",
             has_doc,
             |s, p| add_item(s, p, true)
         ),
@@ -45,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add New Stroke",
             ["Window", "Appearance"],
             None,
-            "{ids?|id?, target?} add a stroke on top of each selected object's own stack (a copy of its top stroke, else the default stroke)",
+            "{ids?|id?, target?} add a stroke on top of each selected object's own stack, on an image right below its Contents row (a copy of its top stroke, else the default stroke)",
             has_doc,
             |s, p| add_item(s, p, false)
         ),
@@ -294,15 +296,15 @@ pub(crate) fn subject_roots(s: &Session) -> Result<Vec<NodeId>> {
     }
 }
 
-/// Objects whose own appearance stack a command edits: `ids`/`id` (layers too), else the
-/// [`subject_roots`]; with `target: "contents"` the painted objects inside the groups and layers
-/// among them ([`leaf_targets`]).
+/// Objects whose own appearance stack a command edits: `ids`/`id` (layers too; an id inside
+/// another given one is dropped), else the [`subject_roots`]; with `target: "contents"` the painted
+/// objects inside the groups and layers among them ([`leaf_targets`]).
 pub(crate) fn appearance_targets(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
     let roots = if p.get("ids").is_none() && p.get("id").is_none() {
         subject_roots(s)?
     } else {
         let d = &s.doc()?.doc;
-        targets(s, p)?.into_iter().filter(|id| d.node(*id).is_some()).collect()
+        outermost(d, targets(s, p)?.into_iter().filter(|id| d.node(*id).is_some()).collect())
     };
     if targets_contents(p)? { leaf_targets(s, &roots) } else { Ok(roots) }
 }
@@ -408,6 +410,9 @@ fn set_active_item(s: &mut Session, p: &Value) -> Result<Value> {
 fn add_item(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
     let ids = require_targets(s, p, if fill { "appearance.addFill" } else { "appearance.addStroke" })?;
     let defaults = s.paint.clone();
+    // Where the new item went in on the active item's object, when it is an image.
+    let active = s.active_appearance_item.as_ref().and_then(|a| a.objects.first().copied());
+    let mut inserted = None;
     s.edit(if fill { "Add New Fill" } else { "Add New Stroke" }, |d, _| {
         for id in &ids {
             if let Some(n) = d.node_mut(*id) {
@@ -429,11 +434,23 @@ fn add_item(s: &mut Session, p: &Value, fill: bool) -> Result<Value> {
                 } else {
                     AppearanceItem::Stroke(StrokeLayer::new(paint, n.appearance.stroke_width().max(1.0)))
                 };
-                n.appearance.items.push(item);
+                if matches!(n.kind, NodeKind::Image(_)) {
+                    // On an image it goes right below the Contents row (the image).
+                    let k = n.appearance.contents_at();
+                    n.appearance.items.insert(k, item);
+                    n.appearance.set_contents_at(k + 1);
+                    if active == Some(*id) {
+                        inserted = Some(k);
+                    }
+                } else {
+                    n.appearance.items.push(item);
+                }
             }
         }
         Ok(())
     })?;
+    // The rows above the new item move up by one.
+    s.remap_appearance_item(&ids, |a| Some(a + usize::from(inserted.is_some_and(|k| k <= a))));
     ok()
 }
 
@@ -478,7 +495,7 @@ fn transfer(s: &mut Session, p: &Value) -> Result<Value> {
         if let (Some(f), Some(t)) = (src.geometric_bounds(), to.geometric_bounds()) {
             ap.rebase_gradients(f, t);
         }
-        // Only groups, layers and type have a Contents (Characters) row to keep a slot for.
+        // Only groups, layers, type and images have a Contents (Characters) row to keep a slot for.
         if to.contents_label().is_none() {
             ap.contents_index = None;
         }
@@ -560,7 +577,7 @@ fn set_item(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             };
             if let Some(pa) = &paint {
-                *pp = super::gradient::place_paint(pa, p, bounds);
+                *pp = super::gradient::place_paint(&super::paint::keep_pattern_xf(pa, p, Some(&*pp)), p, bounds);
             }
             if let Some(o) = p.get("opacity").and_then(Value::as_f64) {
                 *op = percent(o);
@@ -717,7 +734,7 @@ fn move_contents(s: &mut Session, ids: &[NodeId], to: usize) -> Result<Value> {
             n.appearance.set_contents_at(to);
             slot.get_or_insert(n.appearance.contents_at());
         }
-        slot.ok_or_else(|| bad("appearance.moveItem", "only groups, layers and type have a Contents (Characters) row"))?;
+        slot.ok_or_else(|| bad("appearance.moveItem", "only groups, layers, type and images have a Contents (Characters) row"))?;
         Ok(count_changed(d, &before, ids))
     })?;
     Ok(json!({ "contents": slot }))
@@ -745,7 +762,7 @@ fn copy_from(s: &mut Session, p: &Value) -> Result<Value> {
     let (reverse, append) = (bool_or(p, "reverse", false), bool_or(p, "append", false));
     let attrs = s.prefs.eyedropper.attrs(p).map_err(|e| bad(C, e))?;
     let selected = match ids_param(p, "ids") {
-        Some(v) => v,
+        Some(v) => outermost(&s.doc()?.doc, v),
         None => selected_roots(s)?,
     };
     // Reversed, the first selected object's attributes go onto the clicked object.
