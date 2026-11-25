@@ -15,7 +15,7 @@ Overlap repeats part of the drawing on adjacent sheets to help you align them af
 3. In **General**, under **Artboards**, choose **All** or **Range:** to select the artboards to print.
    For example, use **Range:** `1` for the first artboard. Choose **Ignore Artboards (all the art as
    one page)** only if you want to tile the bounds of all the artwork instead of individual artboards.
-4. Under **Media**, set **Size** to the paper loaded in the printer, such as **A4** or **Letter**.
+4. Under **Media**, set **Size** to the paper loaded in the printer, such as **A4**, **Letter** or a Japanese paper (**B5 (JIS)**, **Japanese Postcard**, **Japanese Envelope #3**).
    Choose **Custom** to enter **Width** and **Height**. **Auto-Rotate (turn the paper to each artboard)**
    is on by default; turn it off to choose a fixed **Orientation**, such as **Portrait** or **Landscape**.
 5. In **Advanced**, set **Unprintable margin** to allow for the edges your printer cannot print.
@@ -48,6 +48,15 @@ For a paper proof, select **PDF File** and click **Print**, then open the saved 
 pages before sending it to a printer. When printing that PDF, keep its page size and scale rather
 than applying another fit-to-page reduction. For a sewing pattern, measure a known length on a
 printed sheet before printing the full job.
+
+## Direct PDF on PCL-only printers
+
+Some Windows PCL drivers rewrite a custom page to a different physical size; the HP DesignJet
+Z5200ps V4, for example, turns a 1067 x 480 mm page into a square PCL page. In **Print**, under
+**Printer**, turn on **Send PDF directly (bypass driver)**. VectorCraft then writes the print-ready
+PDF to the selected printer's Standard TCP/IP RAW port, so the printer's own PDF interpreter prints
+the PDF's page size. It needs a printer with PDF support and a RAW TCP/IP port; it bypasses the
+Windows driver's paper, colour and finishing settings. Leave it off for ordinary driver printing.
 
 ## Choose a tiling mode
 

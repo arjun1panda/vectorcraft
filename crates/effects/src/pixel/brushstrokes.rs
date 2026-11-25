@@ -43,7 +43,7 @@ pub enum StrokeDirection {
 }
 
 impl StrokeDirection {
-    const ALL: [StrokeDirection; 4] =
+    pub(super) const ALL: [StrokeDirection; 4] =
         [StrokeDirection::RightDiagonal, StrokeDirection::Horizontal, StrokeDirection::LeftDiagonal, StrokeDirection::Vertical];
 
     /// The direction of `value` (a [`STROKE_DIRECTIONS`] value, any case); Right Diagonal
@@ -53,7 +53,7 @@ impl StrokeDirection {
     }
 
     /// The unit vector along the strokes (document axes, y down).
-    fn along(self) -> Vec2 {
+    pub(super) fn along(self) -> Vec2 {
         match self {
             StrokeDirection::RightDiagonal => RIGHT,
             StrokeDirection::Horizontal => Vec2::new(1.0, 0.0),
@@ -231,7 +231,7 @@ fn frame(q: Point, dir: Vec2) -> (f64, f64) {
 /// How far along `dir` the stroke through `q` is shifted: strokes `len` long lie in rows `width`
 /// apart across `dir`, each row starting at random, each stroke shifted by up to [`JITTER`] ×
 /// `len`.
-fn stroke_shift(salt: u64, q: Point, dir: Vec2, len: f64, width: f64) -> f64 {
+pub(super) fn stroke_shift(salt: u64, q: Point, dir: Vec2, len: f64, width: f64) -> f64 {
     if !(len > 0.0 && width > 0.0) {
         return 0.0;
     }
